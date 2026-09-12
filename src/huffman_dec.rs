@@ -111,7 +111,14 @@ fn generate_canonical_codes(sizes: &[u8; 256], symbols: &mut [u8]) -> [u16; 256]
     codes
 }
 
-fn build_decoding_table(sizes: &[u8; 256], codes: &[u16; 256], symbols: &[u8], table: &mut [u16]) {
+/// Port of Go's buildDecodingTable, including its bounds check (Go:
+/// `if int(end) > len(this.table) { return false }`) -- dropping that
+/// check let a corrupted code length turn into an out-of-bounds `table`
+/// write instead of a clean decode error. `sizes[s]` is guaranteed
+/// in (0, MAX_SYMBOL_SIZE] by the caller's own validation (mirroring
+/// Go's readLengths check) before this ever runs, but the bounds check
+/// is kept anyway, exactly like Go keeps both -- belt and suspenders.
+fn build_decoding_table(sizes: &[u8; 256], codes: &[u16; 256], symbols: &[u8], table: &mut [u16]) -> bool {
     for v in table.iter_mut() {
         *v = 7;
     }
@@ -120,14 +127,26 @@ fn build_decoding_table(sizes: &[u8; 256], codes: &[u16; 256], symbols: &[u8], t
 
     for &s in symbols {
         let len = sizes[s as usize] as u32;
+
+        if len == 0 || len > shift {
+            return false;
+        }
+
         let idx = (codes[s as usize] as u32) << (shift - len);
         let end = idx + (1u32 << (shift - len));
+
+        if end as usize > table.len() {
+            return false;
+        }
+
         let val = ((s as u16) << 8) | (sizes[s as usize] as u16);
 
         for j in idx..end {
             table[j as usize] = val;
         }
     }
+
+    true
 }
 
 /// Loads one 8-byte big-endian refill word and folds it into `state`,
@@ -219,6 +238,19 @@ impl HuffmanDecoderV6 {
                 for &s in &symbols {
                     let delta = exp_golomb_decode_signed_byte(br);
                     cur_size = cur_size.wrapping_add(delta);
+
+                    // Port of Go's readLengths check. Without this, a
+                    // corrupted delta can leave `cur_size` <= 0 or above
+                    // MAX_SYMBOL_SIZE, which build_decoding_table would
+                    // otherwise turn into a bogus shift amount and an
+                    // out-of-bounds table write instead of a clean error.
+                    if cur_size <= 0 || cur_size as u32 > MAX_SYMBOL_SIZE {
+                        return Err(format!(
+                            "Invalid bitstream: incorrect size {} for Huffman symbol {}",
+                            cur_size, s
+                        ));
+                    }
+
                     sizes[s as usize] = cur_size as u8;
                 }
 
@@ -230,7 +262,11 @@ impl HuffmanDecoderV6 {
                     }
                 } else {
                     let codes = generate_canonical_codes(&sizes, &mut symbols);
-                    build_decoding_table(&sizes, &codes, &symbols, &mut self.table);
+
+                    if !build_decoding_table(&sizes, &codes, &symbols, &mut self.table) {
+                        return Err("Invalid bitstream: incorrect symbol size".to_string());
+                    }
+
                     self.decode_chunk_v6(
                         br,
                         &mut out[start_chunk..start_chunk + size_chunk],
