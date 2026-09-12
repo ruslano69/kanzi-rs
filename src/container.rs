@@ -154,6 +154,93 @@ fn log2_bytes_needed(x: u32) -> u32 {
     }
 }
 
+/// Splits `data` into `block_size`-byte chunks (the last one may be
+/// shorter) and encodes them concurrently across up to
+/// `available_parallelism()` OS threads, returning each block's
+/// `(encoded_bytes, written_bits)` in original order -- ready to feed
+/// straight into `write_framed_block` in a plain sequential loop.
+///
+/// Every block in this container format is fully self-contained: each
+/// `encode_blockN` call gets a fresh entropy-coder instance (TPAQ/CM/FPAQ
+/// all reset per block) and every transform either has no cross-block
+/// state at all or explicitly reinitializes it at the top of `forward()`
+/// (e.g. LzpCodec/LzxCodec's hash tables) -- exactly the property the
+/// real CLI's own `-j` concurrency already relies on for the identical
+/// wire format. So encoding blocks out of order is always safe; only the
+/// *output* order must be preserved, which this does by writing each
+/// result back into its original slot before the caller frames it.
+///
+/// `make_state` builds one thread-local scratch value per worker, created
+/// once and reused across every block that worker handles -- e.g. a
+/// `Bwt`'s internal buffers get reallocated only on growth, not per
+/// block, matching the reuse pattern the single-threaded loop used to get
+/// from sharing one instance across the whole call. `encode_one` encodes
+/// a single block given that worker's state.
+fn encode_blocks_parallel<S, F>(data: &[u8], block_size: u32, make_state: impl Fn() -> S + Sync, encode_one: F) -> Vec<(Vec<u8>, u64)>
+where
+    S: Send,
+    F: Fn(&mut S, &[u8]) -> (Vec<u8>, u64) + Sync,
+{
+    let mut ranges = Vec::new();
+    let mut offset = 0usize;
+
+    while offset < data.len() {
+        let len = (block_size as usize).min(data.len() - offset);
+        ranges.push((offset, len));
+        offset += len;
+    }
+
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(ranges.len());
+    let mut results: Vec<Option<(Vec<u8>, u64)>> = (0..ranges.len()).map(|_| None).collect();
+
+    if workers <= 1 {
+        let mut state = make_state();
+
+        for (i, &(off, len)) in ranges.iter().enumerate() {
+            results[i] = Some(encode_one(&mut state, &data[off..off + len]));
+        }
+    } else {
+        std::thread::scope(|scope| {
+            let chunk = (ranges.len() + workers - 1) / workers;
+            let mut handles = Vec::new();
+
+            for start in (0..ranges.len()).step_by(chunk) {
+                let end = (start + chunk).min(ranges.len());
+                let ranges_ref = &ranges;
+                let make_state_ref = &make_state;
+                let encode_one_ref = &encode_one;
+
+                handles.push(scope.spawn(move || {
+                    let mut state = make_state_ref();
+                    let mut local = Vec::with_capacity(end - start);
+
+                    for i in start..end {
+                        let (off, len) = ranges_ref[i];
+                        local.push((i, encode_one_ref(&mut state, &data[off..off + len])));
+                    }
+
+                    local
+                }));
+            }
+
+            for h in handles {
+                for (i, res) in h.join().expect("encoder worker thread panicked") {
+                    results[i] = Some(res);
+                }
+            }
+        });
+    }
+
+    results.into_iter().map(|r| r.expect("every block range was assigned to exactly one worker")).collect()
+}
+
 /// Encodes `data` as a complete level-1 (LZX & NONE) kanzi bitstream:
 /// no input-size hint, single job, block size `block_size`. `ck_size`
 /// selects the optional per-block checksum (0=none, 1=32-bit, 2=64-bit --
@@ -164,15 +251,12 @@ pub fn encode_level1(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
     let transform_type: u64 = LZX_TYPE << BFF_MAX_SHIFT;
     write_stream_header(&mut bw, NONE_ENTROPY, transform_type, block_size, &hasher);
 
-    let mut lzx = LzxCodec::new(true);
-    let mut offset = 0usize;
+    let blocks = encode_blocks_parallel(data, block_size, || LzxCodec::new(true), |lzx, block| {
+        encode_block(block, lzx, hasher.checksum(block))
+    });
 
-    while offset < data.len() {
-        let len = block_size.min((data.len() - offset) as u32) as usize;
-        let block = &data[offset..offset + len];
-        let (encoded_block, written) = encode_block(block, &mut lzx, hasher.checksum(block));
-        write_framed_block(&mut bw, &encoded_block, written);
-        offset += len;
+    for (encoded_block, written) in &blocks {
+        write_framed_block(&mut bw, encoded_block, *written);
     }
 
     // End marker: an empty (0-bit) block signals end of stream.
@@ -192,15 +276,12 @@ pub fn encode_level2(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
         (DNA_TYPE << BFF_MAX_SHIFT) | (LZ_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT));
     write_stream_header(&mut bw, HUFFMAN_ENTROPY, transform_type, block_size, &hasher);
 
-    let mut lzx = LzxCodec::new(false);
-    let mut offset = 0usize;
+    let blocks = encode_blocks_parallel(data, block_size, || LzxCodec::new(false), |lzx, block| {
+        encode_block2(block, lzx, hasher.checksum(block))
+    });
 
-    while offset < data.len() {
-        let len = block_size.min((data.len() - offset) as u32) as usize;
-        let block = &data[offset..offset + len];
-        let (encoded_block, written) = encode_block2(block, &mut lzx, hasher.checksum(block));
-        write_framed_block(&mut bw, &encoded_block, written);
-        offset += len;
+    for (encoded_block, written) in &blocks {
+        write_framed_block(&mut bw, encoded_block, *written);
     }
 
     bw.write_bits(0, 5);
@@ -537,15 +618,12 @@ pub fn encode_level3(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
         | (LZX_TYPE << (BFF_MAX_SHIFT - 4 * BFF_ONE_SHIFT));
     write_stream_header(&mut bw, HUFFMAN_ENTROPY, transform_type, block_size, &hasher);
 
-    let mut lzx = LzxCodec::new(true);
-    let mut offset = 0usize;
+    let blocks = encode_blocks_parallel(data, block_size, || LzxCodec::new(true), |lzx, block| {
+        encode_block3(block, lzx, block_size, hasher.checksum(block))
+    });
 
-    while offset < data.len() {
-        let len = block_size.min((data.len() - offset) as u32) as usize;
-        let block = &data[offset..offset + len];
-        let (encoded_block, written) = encode_block3(block, &mut lzx, block_size, hasher.checksum(block));
-        write_framed_block(&mut bw, &encoded_block, written);
-        offset += len;
+    for (encoded_block, written) in &blocks {
+        write_framed_block(&mut bw, encoded_block, *written);
     }
 
     bw.write_bits(0, 5);
@@ -650,15 +728,12 @@ pub fn encode_level4(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
     let hasher = Hasher::new(ck_size).expect("invalid ck_size");
     write_stream_header(&mut bw, NONE_ENTROPY, transform_type, block_size, &hasher);
 
-    let mut rolz = RolzCodec::new();
-    let mut offset = 0usize;
+    let blocks = encode_blocks_parallel(data, block_size, RolzCodec::new, |rolz, block| {
+        encode_block4(block, rolz, block_size, hasher.checksum(block))
+    });
 
-    while offset < data.len() {
-        let len = block_size.min((data.len() - offset) as u32) as usize;
-        let block = &data[offset..offset + len];
-        let (encoded_block, written) = encode_block4(block, &mut rolz, block_size, hasher.checksum(block));
-        write_framed_block(&mut bw, &encoded_block, written);
-        offset += len;
+    for (encoded_block, written) in &blocks {
+        write_framed_block(&mut bw, encoded_block, *written);
     }
 
     bw.write_bits(0, 5);
@@ -772,15 +847,12 @@ pub fn encode_level5(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
     let hasher = Hasher::new(ck_size).expect("invalid ck_size");
     write_stream_header(&mut bw, ANS0_ENTROPY, transform_type, block_size, &hasher);
 
-    let mut bwt = Bwt::new();
-    let mut offset = 0usize;
+    let blocks = encode_blocks_parallel(data, block_size, Bwt::new, |bwt, block| {
+        encode_block5(block, bwt, block_size, hasher.checksum(block))
+    });
 
-    while offset < data.len() {
-        let len = block_size.min((data.len() - offset) as u32) as usize;
-        let block = &data[offset..offset + len];
-        let (encoded_block, written) = encode_block5(block, &mut bwt, block_size, hasher.checksum(block));
-        write_framed_block(&mut bw, &encoded_block, written);
-        offset += len;
+    for (encoded_block, written) in &blocks {
+        write_framed_block(&mut bw, encoded_block, *written);
     }
 
     bw.write_bits(0, 5);
@@ -883,15 +955,12 @@ pub fn encode_level6(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
     let hasher = Hasher::new(ck_size).expect("invalid ck_size");
     write_stream_header(&mut bw, FPAQ_ENTROPY, transform_type, block_size, &hasher);
 
-    let mut bwt = Bwt::new();
-    let mut offset = 0usize;
+    let blocks = encode_blocks_parallel(data, block_size, Bwt::new, |bwt, block| {
+        encode_block6(block, bwt, block_size, hasher.checksum(block))
+    });
 
-    while offset < data.len() {
-        let len = block_size.min((data.len() - offset) as u32) as usize;
-        let block = &data[offset..offset + len];
-        let (encoded_block, written) = encode_block6(block, &mut bwt, block_size, hasher.checksum(block));
-        write_framed_block(&mut bw, &encoded_block, written);
-        offset += len;
+    for (encoded_block, written) in &blocks {
+        write_framed_block(&mut bw, encoded_block, *written);
     }
 
     bw.write_bits(0, 5);
@@ -1003,14 +1072,12 @@ pub fn encode_level0(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
     let mut bw = BitWriter::new();
     write_stream_header(&mut bw, NONE_ENTROPY, 0, block_size, &hasher);
 
-    let mut offset = 0usize;
+    let blocks = encode_blocks_parallel(data, block_size, || (), |_state, block| {
+        encode_block0(block, hasher.checksum(block))
+    });
 
-    while offset < data.len() {
-        let len = block_size.min((data.len() - offset) as u32) as usize;
-        let block = &data[offset..offset + len];
-        let (encoded_block, written) = encode_block0(block, hasher.checksum(block));
-        write_framed_block(&mut bw, &encoded_block, written);
-        offset += len;
+    for (encoded_block, written) in &blocks {
+        write_framed_block(&mut bw, encoded_block, *written);
     }
 
     bw.write_bits(0, 5);
@@ -1046,18 +1113,15 @@ pub fn encode_level7(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
         | (LZP_TYPE << (BFF_MAX_SHIFT - 4 * BFF_ONE_SHIFT));
     write_stream_header(&mut bw, CM_ENTROPY, transform_type, block_size, &hasher);
 
-    let mut lzp0 = LzpCodec::new();
-    let mut bwt = Bwt::new();
-    let mut lzp1 = LzpCodec::new();
-    let mut offset = 0usize;
+    let blocks = encode_blocks_parallel(
+        data,
+        block_size,
+        || (LzpCodec::new(), Bwt::new(), LzpCodec::new()),
+        |(lzp0, bwt, lzp1), block| encode_block7(block, lzp0, bwt, lzp1, block_size, hasher.checksum(block)),
+    );
 
-    while offset < data.len() {
-        let len = block_size.min((data.len() - offset) as u32) as usize;
-        let block = &data[offset..offset + len];
-        let (encoded_block, written) =
-            encode_block7(block, &mut lzp0, &mut bwt, &mut lzp1, block_size, hasher.checksum(block));
-        write_framed_block(&mut bw, &encoded_block, written);
-        offset += len;
+    for (encoded_block, written) in &blocks {
+        write_framed_block(&mut bw, encoded_block, *written);
     }
 
     bw.write_bits(0, 5);
@@ -1171,14 +1235,12 @@ fn encode_level89(data: &[u8], block_size: u32, extra: bool, ck_size: u64) -> Ve
     let entropy_type = if extra { TPAQX_ENTROPY } else { TPAQ_ENTROPY };
     write_stream_header(&mut bw, entropy_type, transform_type, block_size, &hasher);
 
-    let mut offset = 0usize;
+    let blocks = encode_blocks_parallel(data, block_size, || (), |_state, block| {
+        encode_block89(block, block_size, extra, hasher.checksum(block))
+    });
 
-    while offset < data.len() {
-        let len = block_size.min((data.len() - offset) as u32) as usize;
-        let block = &data[offset..offset + len];
-        let (encoded_block, written) = encode_block89(block, block_size, extra, hasher.checksum(block));
-        write_framed_block(&mut bw, &encoded_block, written);
-        offset += len;
+    for (encoded_block, written) in &blocks {
+        write_framed_block(&mut bw, encoded_block, *written);
     }
 
     bw.write_bits(0, 5);
@@ -2090,9 +2152,14 @@ fn decode_block_payload(br: &mut BitReader, block_header: &BlockHeader, hdr: &St
 pub fn decode(data: &[u8]) -> Result<Vec<u8>, String> {
     let mut br = BitReader::new(data);
     let hdr = read_stream_header(&mut br)?;
-    let mut out = Vec::new();
-
     let debug = std::env::var("KDEBUG").is_ok();
+
+    // Phase 1: a cheap sequential pass that only *locates* each block --
+    // its bit position right after the length prefix, and its bit length
+    // -- without decoding any of its content. `skip_bits` is O(1), so this
+    // whole pass costs O(block count), not O(total bits), regardless of
+    // how large the blocks themselves are.
+    let mut spans: Vec<(usize, u64)> = Vec::new();
     let mut block_id = 0;
 
     loop {
@@ -2117,11 +2184,123 @@ pub fn decode(data: &[u8]) -> Result<Vec<u8>, String> {
             );
         }
 
-        let block = decode_block(&mut br, written, &hdr, debug)?;
+        spans.push((br.bits_read(), written));
+        br.skip_bits(written as usize);
+    }
+
+    // Phase 2: every block is a fully self-contained framed unit -- its
+    // own header, checksum and entropy state, freshly (re)initialized on
+    // decode (see encode_blocks_parallel's doc comment for why) -- so once
+    // its bit range is known it can be decoded from an independent
+    // `BitReader` anchored at that offset, concurrently with every other
+    // block, mirroring the encode side's parallelism.
+    let decoded = decode_blocks_parallel(data, &spans, &hdr, debug)?;
+    let mut out = Vec::with_capacity(decoded.iter().map(|b| b.len()).sum());
+
+    for block in decoded {
         out.extend_from_slice(&block);
     }
 
     Ok(out)
+}
+
+/// Extracts a human-readable message from a caught panic payload (the
+/// `Err` side of `std::thread::Result`), matching the two shapes
+/// `panic!`/`.expect()`/indexing panics normally produce.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Decodes every block named in `spans` (each `(start_bit_pos,
+/// written_bits)`, as located by `decode`'s first pass) across up to
+/// `available_parallelism()` threads, returning them in original order.
+///
+/// This project's decoders are already extensively hardened against
+/// panicking on corrupted input (see the BWT/ANS/TPAQ robustness audit),
+/// but every decoder here ultimately runs on untrusted bytes, so as a
+/// last line of defense any panic inside a worker thread is caught via
+/// `join()` (which a scoped-thread panic never propagates past on its
+/// own) and turned into the same kind of `Err` a clean validation failure
+/// would produce, rather than letting it take down the whole process --
+/// a `catch_unwind`-equivalent safety net that this parallel split gives
+/// us for free.
+fn decode_blocks_parallel(data: &[u8], spans: &[(usize, u64)], hdr: &StreamHeader, debug: bool) -> Result<Vec<Vec<u8>>, String> {
+    if spans.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(spans.len());
+
+    if workers <= 1 {
+        return spans
+            .iter()
+            .map(|&(pos, written)| {
+                let mut local = BitReader::at_bit_pos(data, pos);
+                decode_block(&mut local, written, hdr, debug)
+            })
+            .collect();
+    }
+
+    let mut results: Vec<Option<Result<Vec<u8>, String>>> = (0..spans.len()).map(|_| None).collect();
+
+    std::thread::scope(|scope| {
+        let chunk = (spans.len() + workers - 1) / workers;
+        let mut handles = Vec::new();
+
+        for start in (0..spans.len()).step_by(chunk) {
+            let end = (start + chunk).min(spans.len());
+            let spans_ref = spans;
+
+            let handle = scope.spawn(move || {
+                let mut local = Vec::with_capacity(end - start);
+
+                for i in start..end {
+                    let (pos, written) = spans_ref[i];
+                    let mut br = BitReader::at_bit_pos(data, pos);
+                    local.push((i, decode_block(&mut br, written, hdr, debug)));
+                }
+
+                local
+            });
+
+            handles.push((start, end, handle));
+        }
+
+        for (start, end, handle) in handles {
+            match handle.join() {
+                Ok(items) => {
+                    for (i, res) in items {
+                        results[i] = Some(res);
+                    }
+                }
+                Err(payload) => {
+                    let msg = panic_message(payload.as_ref());
+
+                    for i in start..end {
+                        results[i] = Some(Err(format!(
+                            "decoder worker thread panicked while decoding block {}: {}",
+                            i + 1,
+                            msg
+                        )));
+                    }
+                }
+            }
+        }
+    });
+
+    results
+        .into_iter()
+        .map(|r| r.expect("every block span was assigned to exactly one worker"))
+        .collect()
 }
 
 /// Encodes one block's local (byte-aligned) buffer:

@@ -94,8 +94,29 @@ impl<'a> BitReader<'a> {
         BitReader { data, pos: 0 }
     }
 
+    /// Anchors a fresh reader at an arbitrary absolute bit position within
+    /// `data`, instead of the start. Used to decode a container block
+    /// in-place from a shared byte buffer without first slicing/copying
+    /// out its (not necessarily byte-aligned) bit range -- e.g. one worker
+    /// thread per block in the container's parallel block decode, each
+    /// independently reading from `data` starting at that block's own
+    /// framed-length-prefix-relative offset (see `container::decode`).
+    pub fn at_bit_pos(data: &'a [u8], pos: usize) -> Self {
+        BitReader { data, pos }
+    }
+
     pub fn bits_read(&self) -> usize {
         self.pos
+    }
+
+    /// Advances the cursor by `n` bits without reading anything -- for
+    /// skipping over a block's payload during a first pass that only
+    /// needs to locate block boundaries (container::decode's parallel
+    /// split), not decode their content. O(1) instead of O(n/64) since
+    /// nothing needs to be fetched or shifted.
+    #[inline]
+    pub fn skip_bits(&mut self, n: usize) {
+        self.pos += n;
     }
 
     /// Reads past the end of `data` return 0 rather than panicking (see
