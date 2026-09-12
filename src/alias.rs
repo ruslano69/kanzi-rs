@@ -4,9 +4,10 @@
 //     most frequent digrams of any data into unused single-byte aliases, or
 //     bit-packs tiny alphabets (n0>=240).
 //
-// Both Forward and Inverse are fully ported (unlike the UTF/MM stub stages):
-// the success path is data-dependent and common (e.g. PACK applies to
-// ordinary source-code text), so declining-only would be incorrect, not just
+// Both Forward and Inverse are fully ported, success path included (like
+// utf.rs and fsd.rs, and unlike a plain decline-only stub): the success
+// path is data-dependent and common (e.g. PACK applies to ordinary
+// source-code text), so declining-only would be incorrect, not just
 // suboptimal. The ctx["dataType"] side effect (set even when declining) is
 // modeled as a DataType value threaded through Forward's Ok/Err returns,
 // exactly like text_codec.rs does.
