@@ -17,6 +17,7 @@ mod lzx;
 mod magic;
 mod rlt;
 mod rolz;
+mod sais;
 mod sbrt;
 mod srt;
 mod text_codec;
@@ -209,6 +210,97 @@ fn main() {
                         break;
                     }
                 }
+                std::process::exit(1);
+            }
+        }
+        "saistest" => {
+            // Brute-force cross-check of sais::suffix_array against a naive
+            // O(n^2 log n) reference sort, on small/pathological inputs
+            // (tiny alphabets, long runs, all-same-byte) where SA-IS's
+            // recursion and edge cases are most likely to misbehave.
+            fn suffix_less(text: &[u8], a: usize, b: usize) -> std::cmp::Ordering {
+                let n = text.len();
+                let mut i = a;
+                let mut j = b;
+                loop {
+                    let ci = if i < n { Some(text[i]) } else { None };
+                    let cj = if j < n { Some(text[j]) } else { None };
+                    match (ci, cj) {
+                        (None, None) => return std::cmp::Ordering::Equal,
+                        (None, Some(_)) => return std::cmp::Ordering::Less,
+                        (Some(_), None) => return std::cmp::Ordering::Greater,
+                        (Some(x), Some(y)) if x != y => return x.cmp(&y),
+                        _ => {
+                            i += 1;
+                            j += 1;
+                        }
+                    }
+                }
+            }
+
+            fn reference_sa(text: &[u8]) -> Vec<u32> {
+                let mut idx: Vec<u32> = (0..text.len() as u32).collect();
+                idx.sort_by(|&a, &b| suffix_less(text, a as usize, b as usize));
+                idx
+            }
+
+            fn check(text: &[u8], label: &str) -> bool {
+                let got = sais::suffix_array(text);
+                let want = reference_sa(text);
+                if got == want {
+                    true
+                } else {
+                    println!("[{}] MISMATCH len={}", label, text.len());
+                    println!("  got:  {:?}", &got[..got.len().min(40)]);
+                    println!("  want: {:?}", &want[..want.len().min(40)]);
+                    false
+                }
+            }
+
+            let mut all_ok = true;
+            let mut seed: u64 = 0x1234_5678_9abc_def0;
+            let mut rng = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+
+            // Fixed pathological cases.
+            let cases: Vec<(Vec<u8>, &str)> = vec![
+                (b"aa".to_vec(), "aa"),
+                (b"ab".to_vec(), "ab"),
+                (b"aaa".to_vec(), "aaa"),
+                (b"aaaa".to_vec(), "aaaa"),
+                (vec![0u8; 200], "all-zero-200"),
+                (vec![255u8; 200], "all-0xFF-200"),
+                (b"banana".to_vec(), "banana"),
+                (b"mississippi".to_vec(), "mississippi"),
+                (b"abababababababab".to_vec(), "abab-16"),
+                ((0..=255u16).map(|x| x as u8).collect(), "0..255"),
+                ((0..=255u16).rev().map(|x| x as u8).collect(), "255..0"),
+            ];
+
+            for (text, label) in &cases {
+                if !check(text, label) {
+                    all_ok = false;
+                }
+            }
+
+            // Random small/medium inputs, varying alphabet size (small
+            // alphabets stress SA-IS's recursion the most).
+            for trial in 0..500 {
+                let len = 1 + (rng() % 300) as usize;
+                let alphabet: u32 = [1, 2, 4, 8, 26, 256][(trial % 6) as usize];
+                let text: Vec<u8> = (0..len).map(|_| (rng() % alphabet as u64) as u8).collect();
+                if !check(&text, &format!("random#{trial} len={len} alphabet={alphabet}")) {
+                    all_ok = false;
+                }
+            }
+
+            if all_ok {
+                println!("saistest: ALL OK");
+            } else {
                 std::process::exit(1);
             }
         }

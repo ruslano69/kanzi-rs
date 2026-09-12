@@ -2,13 +2,17 @@
 // (transform/BWTBlockCodec.go) over the BWT core (transform/BWT.go).
 //
 // Forward suffix-array construction purposefully does NOT port DivSufSort
-// (transform/DivSufSort.go, ~2700 lines of induced-sorting): the BWT output
-// and primary indexes derive deterministically from the plain suffix array
-// (which is unique -- all n suffixes are pairwise distinct strings), so any
-// correct SA construction yields byte-identical results. This port builds
-// the SA with prefix-doubling + 2-pass radix sort (O(n log n) time, simple
-// and obviously correct), verified byte-exact against Go. It is slower than
-// DivSufSort on huge blocks; that is the known cost of the smaller port.
+// (transform/DivSufSort.go, ~2700 lines of Go/Java-specific induced-sorting
+// bookkeeping): the BWT output and primary indexes derive deterministically
+// from the plain suffix array (which is unique -- all n suffixes are
+// pairwise distinct strings), so any correct SA construction yields
+// byte-identical results. This port builds the SA with SA-IS instead (see
+// sais.rs) -- a different, from-scratch, well-documented induced-sorting
+// algorithm in the same near-linear complexity class as DivSufSort, chosen
+// over a literal port for much lower risk of mistranslating DivSufSort's
+// specific micro-optimizations. (An earlier version of this port used
+// prefix-doubling + 2-pass radix sort, O(n log n) and noticeably slower on
+// large blocks; SA-IS replaced it for that reason.)
 //
 // Inverse ports inverseMergeTPSI exactly (single- and 8-chunk walks,
 // sequential -- jobs=1 like this project's single-job container). Go
@@ -74,149 +78,32 @@ fn log2_no_check(x: u32) -> u32 {
 pub struct Bwt {
     buffer: Vec<i32>,
     primary_indexes: [usize; 8],
-    // Suffix-array scratch (reused across calls).
+    // Suffix-array result, reused across calls (sais.rs allocates its own
+    // scratch internally, per call).
     sa: Vec<u32>,
-    tmp_sa: Vec<u32>,
-    rank: Vec<i32>,
-    tmp_rank: Vec<i32>,
-    cnt: Vec<u32>,
 }
 
 impl Bwt {
     pub fn new() -> Self {
-        Bwt {
-            buffer: Vec::new(),
-            primary_indexes: [0usize; 8],
-            sa: Vec::new(),
-            tmp_sa: Vec::new(),
-            rank: Vec::new(),
-            tmp_rank: Vec::new(),
-            cnt: Vec::new(),
-        }
+        Bwt { buffer: Vec::new(), primary_indexes: [0usize; 8], sa: Vec::new() }
     }
 
-    /// Builds the suffix array of `src` with prefix-doubling + radix sort.
-    /// Standard $-sentinel semantics (a shorter suffix sorts first on shared
-    /// prefixes), matching DivSufSort's output exactly.
+    /// Builds the suffix array of `src` via SA-IS (see sais.rs). Standard
+    /// $-sentinel semantics (a shorter suffix sorts first on shared
+    /// prefixes) -- any correct suffix array construction yields the same
+    /// result here (see the module doc comment), so this need not match
+    /// DivSufSort's specific algorithm, just its output.
     fn build_sa(&mut self, src: &[u8]) -> &[u32] {
         let n = src.len();
         debug_assert!(n >= 2);
 
+        let sa = crate::sais::suffix_array(src);
+
         if self.sa.len() < n {
             self.sa = vec![0u32; n];
-            self.tmp_sa = vec![0u32; n];
-            self.rank = vec![0i32; n];
-            self.tmp_rank = vec![0i32; n];
         }
 
-        let (sa, rank, tmp_rank) = (
-            &mut self.sa[..n],
-            &mut self.rank[..n],
-            &mut self.tmp_rank[..n],
-        );
-
-        for (i, s) in sa.iter_mut().enumerate() {
-            *s = i as u32;
-        }
-
-        for (i, &b) in src.iter().enumerate() {
-            rank[i] = b as i32;
-        }
-
-        let mut k = 1usize;
-
-        loop {
-            // 2-pass radix sort by (rank[i], rank[i+k] or -1), second key first.
-            let max_rank = rank.iter().fold(0i32, |m, &r| m.max(r)) as usize;
-            let cnt_len = max_rank + 2; // shifted keys land in [0..max_rank+1]
-
-            if self.cnt.len() < cnt_len {
-                self.cnt = vec![0u32; cnt_len];
-            }
-
-            let (tmp_sa, cnt) = (&mut self.tmp_sa[..n], &mut self.cnt[..cnt_len]);
-
-            // Pass 1: second key.
-            cnt.fill(0);
-
-            for &s in sa.iter() {
-                let key = if (s as usize) + k < n {
-                    (rank[(s as usize) + k] + 1) as usize
-                } else {
-                    0
-                };
-                cnt[key] += 1;
-            }
-
-            let mut sum = 0u32;
-
-            for c in cnt.iter_mut() {
-                let t = *c;
-                *c = sum;
-                sum += t;
-            }
-
-            for &s in sa.iter() {
-                let key = if (s as usize) + k < n {
-                    (rank[(s as usize) + k] + 1) as usize
-                } else {
-                    0
-                };
-                tmp_sa[cnt[key] as usize] = s;
-                cnt[key] += 1;
-            }
-
-            // Pass 2: first key (all >= 0, shifted by +1).
-            cnt.fill(0);
-
-            for &s in tmp_sa.iter() {
-                cnt[(rank[s as usize] + 1) as usize] += 1;
-            }
-
-            sum = 0;
-
-            for c in cnt.iter_mut() {
-                let t = *c;
-                *c = sum;
-                sum += t;
-            }
-
-            for &s in tmp_sa.iter() {
-                let key = (rank[s as usize] + 1) as usize;
-                sa[cnt[key] as usize] = s;
-                cnt[key] += 1;
-            }
-
-            // Re-rank into tmp_rank scratch, then copy back.
-            let mut new_max = 0i32;
-            tmp_rank[sa[0] as usize] = 0;
-
-            for j in 1..n {
-                let a = sa[j - 1] as usize;
-                let b = sa[j] as usize;
-                let a2 = if a + k < n { rank[a + k] } else { -1 };
-                let b2 = if b + k < n { rank[b + k] } else { -1 };
-
-                if rank[a] != rank[b] || a2 != b2 {
-                    new_max += 1;
-                }
-
-                tmp_rank[b] = new_max;
-            }
-
-            rank.copy_from_slice(&tmp_rank[..n]);
-
-            if new_max as usize == n - 1 {
-                break;
-            }
-
-            k *= 2;
-            // Safety net against logic bugs (correct runs terminate with
-            // k <= n): loud panic instead of a hang.
-            debug_assert!(k < 8 * n);
-            assert!(k < 8 * n, "BWT suffix array construction diverged");
-        }
-
+        self.sa[..n].copy_from_slice(&sa);
         &self.sa[..n]
     }
 
