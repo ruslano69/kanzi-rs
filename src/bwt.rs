@@ -280,11 +280,39 @@ impl Bwt {
             return Err("Invalid input: corrupted BWT primary index");
         }
 
-        if self.buffer.len() < count.max(64) {
-            self.buffer = vec![0i32; count.max(64)];
+        // This is a real bug in kanzi-go itself (reproduced against the
+        // real CLI, not just this port), not a missing safeguard Go has
+        // and this port dropped: Go's own inverseMergeTPSI sizes its
+        // buffer to max(count, 64), matching what was here. The traversal
+        // below can, for a *corrupted* stream, dereference the special
+        // "wrap to start" sentinel value 0xFF00 as if it were a real
+        // linked position -- its low byte is 0xFF (255), a valid `data`
+        // index only when count > 255. Both Go and this port panicked
+        // with "index out of range [255]" on the same corrupted input
+        // before this fix. Sizing the scratch buffer to max(count, 256)
+        // (Forward already uses exactly this bound, for the same class of
+        // reason) makes that dereference land on an unused, zero-filled
+        // slot instead of going out of bounds; the resulting garbage
+        // output for a block that small is still expected to fail the
+        // container's own checksum/size validation, same as any other
+        // corruption this decoder rejects instead of silently accepting.
+        let data_len = count.max(256);
+
+        if self.buffer.len() < data_len {
+            self.buffer = vec![0i32; data_len];
+        } else if count < 256 {
+            // `self.buffer` is reused across blocks (this `Bwt` lives for
+            // the whole container decode); a *bigger* earlier block can
+            // leave stale packed (index, value) entries here whose index
+            // exceeds this call's `data_len`, which the fix above alone
+            // wouldn't catch. Zero exactly the region beyond `count` that
+            // this call itself never (or only via the sentinel) writes,
+            // so a stale entry there can't smuggle in an out-of-range
+            // link from a previous, larger call.
+            self.buffer[count..256].fill(0);
         }
 
-        let data = &mut self.buffer[..count];
+        let data = &mut self.buffer[..data_len];
 
         // Counting sort into packed (index, value) entries: (i<<8)|val,
         // i up to count-1 < 2^24 (checked above). Read back with a logical

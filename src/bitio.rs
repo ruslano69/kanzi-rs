@@ -98,9 +98,30 @@ impl<'a> BitReader<'a> {
         self.pos
     }
 
+    /// Reads past the end of `data` return 0 rather than panicking (see
+    /// the module-level fidelity note): every decoder in this project
+    /// assumes wire-format-internal size fields (chunk sizes, symbol
+    /// counts, etc.) are trustworthy, matching Go's own decoders. For a
+    /// corrupted stream those fields can be arbitrary, and following them
+    /// naively can walk this cursor past the actual file content -- e.g.
+    /// an unbounded "read bits until a 1" loop (Huffman's Exp-Golomb
+    /// decode) landing in a long run of corrupted zero bits. Reading zeros
+    /// past the end keeps that deterministic and panic-free; the garbage
+    /// result still gets caught by whatever downstream validation the
+    /// format has (an end-of-chunk size check, a checksum, ...) instead of
+    /// crashing before ever reaching it.
+    #[inline]
+    fn byte_at(&self, idx: usize) -> u8 {
+        if idx < self.data.len() {
+            self.data[idx]
+        } else {
+            0
+        }
+    }
+
     #[inline]
     pub fn read_bit(&mut self) -> u32 {
-        let byte = self.data[self.pos >> 3];
+        let byte = self.byte_at(self.pos >> 3);
         let bit = (byte >> (7 - (self.pos & 7))) & 1;
         self.pos += 1;
         bit as u32
@@ -116,7 +137,7 @@ impl<'a> BitReader<'a> {
             let bit_off = (self.pos & 7) as u32;
             let avail_in_byte = 8 - bit_off;
             let take = remaining.min(avail_in_byte);
-            let byte = self.data[byte_idx] as u64;
+            let byte = self.byte_at(byte_idx) as u64;
             let shift = avail_in_byte - take;
             let mask: u64 = if take == 64 {
                 u64::MAX
@@ -131,14 +152,31 @@ impl<'a> BitReader<'a> {
         result
     }
 
+    /// Reads `count_bits` bits into `dst`. `count_bits` past `8*dst.len()`
+    /// is a caller bug for trusted call sites, but several decoders derive
+    /// it from an untrusted wire-format length field (a chunk byte count,
+    /// say) against a `dst` sized for the *expected* size -- so instead of
+    /// trusting the caller, this clamps the actual write to `dst`'s real
+    /// size (silently dropping any excess, never writing past it) and
+    /// still advances the cursor by the full `count_bits` requested, as if
+    /// the read had fully succeeded. Reading past the end of `data` itself
+    /// returns zeros (see `byte_at`), for the same reason.
     pub fn read_array(&mut self, dst: &mut [u8], count_bits: usize) {
-        let mut remaining = count_bits;
+        let bits_to_write = count_bits.min(dst.len() * 8);
+        let extra_bits = count_bits - bits_to_write;
+        let mut remaining = bits_to_write;
         let mut i = 0;
 
         if self.pos & 7 == 0 {
             let nbytes = remaining >> 3;
             let start = self.pos >> 3;
-            dst[..nbytes].copy_from_slice(&self.data[start..start + nbytes]);
+            let avail = self.data.len().saturating_sub(start).min(nbytes);
+            dst[..avail].copy_from_slice(&self.data[start..start + avail]);
+
+            if avail < nbytes {
+                dst[avail..nbytes].fill(0);
+            }
+
             self.pos += nbytes * 8;
             i = nbytes;
             remaining -= nbytes * 8;
@@ -160,5 +198,10 @@ impl<'a> BitReader<'a> {
             let v = self.read_bits(remaining as u32) as u8;
             dst[i] = v << (8 - remaining);
         }
+
+        // Bits that didn't fit in `dst`: still consume them from the
+        // stream (matching a "successful" read's cursor movement) without
+        // writing anywhere.
+        self.pos += extra_bits;
     }
 }
