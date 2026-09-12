@@ -25,6 +25,7 @@ use crate::text_codec;
 use crate::text_codec1;
 use crate::tpaq::TpaqPredictor;
 use crate::utf;
+use crate::xxhash::{XxHash32, XxHash64};
 use crate::zrlt;
 
 const BITSTREAM_TYPE: u64 = 0x4B414E5A; // "KANZ"
@@ -56,15 +57,53 @@ const SMALL_BLOCK_SIZE: usize = 15;
 const BFF_ONE_SHIFT: u64 = 6;
 const BFF_MAX_SHIFT: u64 = 42; // (8-1)*6
 
-fn write_stream_header(
-    bw: &mut BitWriter,
-    entropy_type: u64,
-    transform_type: u64,
-    block_size: u32,
-) {
+/// Per-stream block-content checksum (the real CLI's -x/-x32/-x64). `None`
+/// means ckSize=0 (the default, and the only mode this project supported
+/// before checksums were added).
+pub enum Hasher {
+    None,
+    H32(XxHash32),
+    H64(XxHash64),
+}
+
+impl Hasher {
+    /// `ck_size`: 0 = none, 1 = 32-bit (XXHash32), 2 = 64-bit (XXHash64) --
+    /// the same encoding as the stream header's ckSize field and the real
+    /// CLI's `checksum` context value (32/64) once normalized to Go's
+    /// internal ckSize units.
+    pub fn new(ck_size: u64) -> Result<Self, String> {
+        match ck_size {
+            0 => Ok(Hasher::None),
+            1 => Ok(Hasher::H32(XxHash32::new(BITSTREAM_TYPE as u32))),
+            2 => Ok(Hasher::H64(XxHash64::new(BITSTREAM_TYPE))),
+            other => Err(format!("Invalid checksum size: {}", other)),
+        }
+    }
+
+    fn ck_size(&self) -> u64 {
+        match self {
+            Hasher::None => 0,
+            Hasher::H32(_) => 1,
+            Hasher::H64(_) => 2,
+        }
+    }
+
+    /// The checksum to embed for one block's original (pre-transform)
+    /// bytes, as (value, byte-width): `None` when no checksum is enabled.
+    fn checksum(&self, data: &[u8]) -> Option<(u64, u8)> {
+        match self {
+            Hasher::None => None,
+            Hasher::H32(h) => Some((h.hash(data) as u64, 4)),
+            Hasher::H64(h) => Some((h.hash(data), 8)),
+        }
+    }
+}
+
+fn write_stream_header(bw: &mut BitWriter, entropy_type: u64, transform_type: u64, block_size: u32, hasher: &Hasher) {
+    let ck_size = hasher.ck_size();
     bw.write_bits(BITSTREAM_TYPE, 32);
     bw.write_bits(BITSTREAM_FORMAT_VERSION, 4);
-    bw.write_bits(0, 2); // ckSize = 0 (no checksum)
+    bw.write_bits(ck_size, 2);
     bw.write_bits(entropy_type, 5);
     bw.write_bits(transform_type, 48);
     bw.write_bits((block_size as u64) >> 4, 28);
@@ -73,7 +112,7 @@ fn write_stream_header(
 
     let seed = 0x01030507u32.wrapping_mul(BITSTREAM_FORMAT_VERSION as u32);
     let mut cksum = HASH.wrapping_mul(seed);
-    cksum = mix32(cksum, HASH, 0); // ckSize
+    cksum = mix32(cksum, HASH, ck_size as u32);
     cksum = mix32(cksum, HASH, entropy_type as u32);
     cksum = mix32(cksum, HASH, (transform_type >> 32) as u32);
     cksum = mix32(cksum, HASH, transform_type as u32);
@@ -116,11 +155,14 @@ fn log2_bytes_needed(x: u32) -> u32 {
 }
 
 /// Encodes `data` as a complete level-1 (LZX & NONE) kanzi bitstream:
-/// checksum=0, no input-size hint, single job, block size `block_size`.
-pub fn encode_level1(data: &[u8], block_size: u32) -> Vec<u8> {
+/// no input-size hint, single job, block size `block_size`. `ck_size`
+/// selects the optional per-block checksum (0=none, 1=32-bit, 2=64-bit --
+/// the real CLI's -x32/-x64).
+pub fn encode_level1(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
+    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
     let mut bw = BitWriter::new();
     let transform_type: u64 = LZX_TYPE << BFF_MAX_SHIFT;
-    write_stream_header(&mut bw, NONE_ENTROPY, transform_type, block_size);
+    write_stream_header(&mut bw, NONE_ENTROPY, transform_type, block_size, &hasher);
 
     let mut lzx = LzxCodec::new(true);
     let mut offset = 0usize;
@@ -128,8 +170,8 @@ pub fn encode_level1(data: &[u8], block_size: u32) -> Vec<u8> {
     while offset < data.len() {
         let len = block_size.min((data.len() - offset) as u32) as usize;
         let block = &data[offset..offset + len];
-        let encoded_block = encode_block(block, &mut lzx);
-        write_framed_block(&mut bw, &encoded_block, encoded_block.len() as u64 * 8);
+        let (encoded_block, written) = encode_block(block, &mut lzx, hasher.checksum(block));
+        write_framed_block(&mut bw, &encoded_block, written);
         offset += len;
     }
 
@@ -143,11 +185,12 @@ pub fn encode_level1(data: &[u8], block_size: u32) -> Vec<u8> {
 /// Encodes `data` as a complete level-2 (DNA+LZ & HUFFMAN) kanzi bitstream.
 /// The DNA/Alias stage is fully ported (see alias.rs), including the genuine
 /// nucleotide-input success path.
-pub fn encode_level2(data: &[u8], block_size: u32) -> Vec<u8> {
+pub fn encode_level2(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
+    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
     let mut bw = BitWriter::new();
     let transform_type: u64 =
         (DNA_TYPE << BFF_MAX_SHIFT) | (LZ_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT));
-    write_stream_header(&mut bw, HUFFMAN_ENTROPY, transform_type, block_size);
+    write_stream_header(&mut bw, HUFFMAN_ENTROPY, transform_type, block_size, &hasher);
 
     let mut lzx = LzxCodec::new(false);
     let mut offset = 0usize;
@@ -155,7 +198,7 @@ pub fn encode_level2(data: &[u8], block_size: u32) -> Vec<u8> {
     while offset < data.len() {
         let len = block_size.min((data.len() - offset) as u32) as usize;
         let block = &data[offset..offset + len];
-        let (encoded_block, written) = encode_block2(block, &mut lzx);
+        let (encoded_block, written) = encode_block2(block, &mut lzx, hasher.checksum(block));
         write_framed_block(&mut bw, &encoded_block, written);
         offset += len;
     }
@@ -182,11 +225,11 @@ fn dna_stage(block: &[u8]) -> (Vec<u8>, u8, DataType) {
     }
 }
 
-fn encode_block2(data: &[u8], lzx: &mut LzxCodec) -> (Vec<u8>, u64) {
+fn encode_block2(data: &[u8], lzx: &mut LzxCodec, checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
     let block_len = data.len();
 
     if block_len <= SMALL_BLOCK_SIZE {
-        return finish_block(data.to_vec(), block_len, true, 0);
+        return finish_block(data.to_vec(), block_len, true, 0, checksum);
     }
 
     let (stage1_out, skip_bit0, dt) = dna_stage(data);
@@ -225,8 +268,9 @@ fn encode_block2(data: &[u8], lzx: &mut LzxCodec) -> (Vec<u8>, u64) {
         stage2_out.len(),
         false,
         skip_nibble,
+        checksum,
     );
-    maybe_transformed_copy(normal, &stage2_out, skip_flags, 2)
+    maybe_transformed_copy(normal, &stage2_out, skip_flags, 2, checksum)
 }
 
 /// Assembles [mode][preTransformLength][headerChecksum][entropy payload]
@@ -238,6 +282,7 @@ fn finish_block2(
     post_transform_len: usize,
     is_copy: bool,
     skip_nibble: u8,
+    payload_checksum: Option<(u64, u8)>,
 ) -> (Vec<u8>, u64) {
     let data_size = log2_bytes_needed(post_transform_len as u32);
     let mut mode: u8 = (((data_size - 1) & 0x03) as u8) << 5;
@@ -257,7 +302,8 @@ fn finish_block2(
         prefix.push(((post_transform_len as u64 >> (8 * i)) & 0xFF) as u8);
     }
 
-    let written = (prefix.len() as u64 + 1) * 8 + entropy_bit_len; // +1 for the checksum byte
+    let checksum_bits = payload_checksum.map(|(_, w)| w as u64 * 8).unwrap_or(0);
+    let written = (prefix.len() as u64 + 1) * 8 + checksum_bits + entropy_bit_len; // +1 for the header checksum byte
 
     let mut cksum = HASH.wrapping_mul(0x01030507u32);
     cksum = mix32(cksum, HASH, mode as u32);
@@ -277,17 +323,28 @@ fn finish_block2(
     let mut bw = BitWriter::new();
     bw.write_array(&prefix, prefix.len() * 8);
     bw.write_bits(cksum as u64, 8);
+
+    if let Some((value, width)) = payload_checksum {
+        bw.write_bits(value, width as u32 * 8);
+    }
+
     bw.write_array(&entropy_bytes, entropy_bit_len as usize);
     (bw.finish(), written)
 }
 
 /// Small-block (<=15 bytes) copy path, shared shape with level 1's
 /// finish_block but kept local to encode_block2 for now.
+/// `payload_checksum` is the optional block-content checksum (computed on
+/// the original, pre-transform bytes -- see `Hasher::checksum`), written
+/// right after the header checksum byte and before the payload, exactly
+/// like Go's "Write checksum" step. It contributes to `written` (and thus
+/// to the header checksum, which covers `written`) like everything else.
 fn finish_block(
     payload: Vec<u8>,
     post_transform_len: usize,
     is_copy: bool,
     skip_nibble_override: u8,
+    payload_checksum: Option<(u64, u8)>,
 ) -> (Vec<u8>, u64) {
     let data_size = log2_bytes_needed(post_transform_len as u32);
     let mut mode: u8 = (((data_size - 1) & 0x03) as u8) << 5;
@@ -309,6 +366,11 @@ fn finish_block(
 
     let checksum_index = buf.len();
     buf.push(0);
+
+    if let Some((value, width)) = payload_checksum {
+        buf.extend_from_slice(&value.to_be_bytes()[8 - width as usize..]);
+    }
+
     buf.extend_from_slice(&payload);
 
     let written = buf.len() as u64 * 8;
@@ -334,6 +396,7 @@ fn finish_block_multi(
     is_copy: bool,
     skip_flags: u8,
     num_transforms: usize,
+    payload_checksum: Option<(u64, u8)>,
 ) -> (Vec<u8>, u64) {
     let (entropy_bytes, entropy_bit_len) = payload;
     let data_size = log2_bytes_needed(post_transform_len as u32);
@@ -362,7 +425,8 @@ fn finish_block_multi(
         prefix.push(((post_transform_len as u64 >> (8 * i)) & 0xFF) as u8);
     }
 
-    let written = (prefix.len() as u64 + 1) * 8 + entropy_bit_len; // +1 for the checksum byte
+    let checksum_bits = payload_checksum.map(|(_, w)| w as u64 * 8).unwrap_or(0);
+    let written = (prefix.len() as u64 + 1) * 8 + checksum_bits + entropy_bit_len; // +1 for the header checksum byte
 
     let mut cksum = HASH.wrapping_mul(0x01030507u32);
     cksum = mix32(cksum, HASH, mode as u32);
@@ -375,6 +439,11 @@ fn finish_block_multi(
     let mut bw = BitWriter::new();
     bw.write_array(&prefix, prefix.len() * 8);
     bw.write_bits(cksum as u64, 8);
+
+    if let Some((value, width)) = payload_checksum {
+        bw.write_bits(value, width as u32 * 8);
+    }
+
     bw.write_array(&entropy_bytes, entropy_bit_len as usize);
     (bw.finish(), written)
 }
@@ -387,6 +456,7 @@ fn finish_block_transformed_copy(
     payload: &[u8],
     skip_flags: u8,
     num_transforms: usize,
+    payload_checksum: Option<(u64, u8)>,
 ) -> (Vec<u8>, u64) {
     let post_len = payload.len();
     let data_size = log2_bytes_needed(post_len as u32);
@@ -413,6 +483,11 @@ fn finish_block_transformed_copy(
     let mut buf = prefix;
     let checksum_index = buf.len();
     buf.push(0); // placeholder, patched below
+
+    if let Some((value, width)) = payload_checksum {
+        buf.extend_from_slice(&value.to_be_bytes()[8 - width as usize..]);
+    }
+
     buf.extend_from_slice(payload);
 
     let written = buf.len() as u64 * 8;
@@ -439,11 +514,12 @@ fn maybe_transformed_copy(
     post_payload: &[u8],
     skip_flags: u8,
     num_transforms: usize,
+    payload_checksum: Option<(u64, u8)>,
 ) -> (Vec<u8>, u64) {
     let (bytes, written) = normal;
 
     if (post_payload.len() as u64) < (written + 7) >> 3 {
-        finish_block_transformed_copy(post_payload, skip_flags, num_transforms)
+        finish_block_transformed_copy(post_payload, skip_flags, num_transforms, payload_checksum)
     } else {
         (bytes, written)
     }
@@ -451,14 +527,15 @@ fn maybe_transformed_copy(
 
 /// Encodes `data` as a complete level-3 (TEXT+UTF+PACK+MM+LZX & HUFFMAN)
 /// kanzi bitstream. TEXT, UTF, PACK, MM/FSD and LZX are all fully ported.
-pub fn encode_level3(data: &[u8], block_size: u32) -> Vec<u8> {
+pub fn encode_level3(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
+    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
     let mut bw = BitWriter::new();
     let transform_type: u64 = (TEXT_TYPE << BFF_MAX_SHIFT)
         | (UTF_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT))
         | (PACK_TYPE << (BFF_MAX_SHIFT - 2 * BFF_ONE_SHIFT))
         | (MM_TYPE << (BFF_MAX_SHIFT - 3 * BFF_ONE_SHIFT))
         | (LZX_TYPE << (BFF_MAX_SHIFT - 4 * BFF_ONE_SHIFT));
-    write_stream_header(&mut bw, HUFFMAN_ENTROPY, transform_type, block_size);
+    write_stream_header(&mut bw, HUFFMAN_ENTROPY, transform_type, block_size, &hasher);
 
     let mut lzx = LzxCodec::new(true);
     let mut offset = 0usize;
@@ -466,7 +543,7 @@ pub fn encode_level3(data: &[u8], block_size: u32) -> Vec<u8> {
     while offset < data.len() {
         let len = block_size.min((data.len() - offset) as u32) as usize;
         let block = &data[offset..offset + len];
-        let (encoded_block, written) = encode_block3(block, &mut lzx, block_size);
+        let (encoded_block, written) = encode_block3(block, &mut lzx, block_size, hasher.checksum(block));
         write_framed_block(&mut bw, &encoded_block, written);
         offset += len;
     }
@@ -477,11 +554,11 @@ pub fn encode_level3(data: &[u8], block_size: u32) -> Vec<u8> {
     bw.finish()
 }
 
-fn encode_block3(data: &[u8], lzx: &mut LzxCodec, block_size: u32) -> (Vec<u8>, u64) {
+fn encode_block3(data: &[u8], lzx: &mut LzxCodec, block_size: u32, checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
     let block_len = data.len();
 
     if block_len <= SMALL_BLOCK_SIZE {
-        return finish_block(data.to_vec(), block_len, true, 0);
+        return finish_block(data.to_vec(), block_len, true, 0, checksum);
     }
 
     // Stage 1: TEXT (real implementation, see text_codec.rs). The data type
@@ -555,14 +632,14 @@ fn encode_block3(data: &[u8], lzx: &mut LzxCodec, block_size: u32) -> (Vec<u8>, 
     henc.write(&stage5_out, &mut ebw);
     let entropy_payload = ebw.finish_with_len();
 
-    let normal = finish_block_multi(entropy_payload, stage5_out.len(), false, skip_flags, 5);
-    maybe_transformed_copy(normal, &stage5_out, skip_flags, 5)
+    let normal = finish_block_multi(entropy_payload, stage5_out.len(), false, skip_flags, 5, checksum);
+    maybe_transformed_copy(normal, &stage5_out, skip_flags, 5, checksum)
 }
 
 /// Encodes `data` as a complete level-4
 /// (TEXT+UTF+EXE+PACK+MM+ROLZ & NONE) kanzi bitstream. TEXT, UTF, EXE, PACK,
 /// MM/FSD and ROLZ are all fully ported.
-pub fn encode_level4(data: &[u8], block_size: u32) -> Vec<u8> {
+pub fn encode_level4(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
     let mut bw = BitWriter::new();
     let transform_type: u64 = (TEXT_TYPE << BFF_MAX_SHIFT)
         | (UTF_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT))
@@ -570,7 +647,8 @@ pub fn encode_level4(data: &[u8], block_size: u32) -> Vec<u8> {
         | (PACK_TYPE << (BFF_MAX_SHIFT - 3 * BFF_ONE_SHIFT))
         | (MM_TYPE << (BFF_MAX_SHIFT - 4 * BFF_ONE_SHIFT))
         | (ROLZ_TYPE << (BFF_MAX_SHIFT - 5 * BFF_ONE_SHIFT));
-    write_stream_header(&mut bw, NONE_ENTROPY, transform_type, block_size);
+    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
+    write_stream_header(&mut bw, NONE_ENTROPY, transform_type, block_size, &hasher);
 
     let mut rolz = RolzCodec::new();
     let mut offset = 0usize;
@@ -578,7 +656,7 @@ pub fn encode_level4(data: &[u8], block_size: u32) -> Vec<u8> {
     while offset < data.len() {
         let len = block_size.min((data.len() - offset) as u32) as usize;
         let block = &data[offset..offset + len];
-        let (encoded_block, written) = encode_block4(block, &mut rolz, block_size);
+        let (encoded_block, written) = encode_block4(block, &mut rolz, block_size, hasher.checksum(block));
         write_framed_block(&mut bw, &encoded_block, written);
         offset += len;
     }
@@ -589,11 +667,11 @@ pub fn encode_level4(data: &[u8], block_size: u32) -> Vec<u8> {
     bw.finish()
 }
 
-fn encode_block4(data: &[u8], rolz: &mut RolzCodec, block_size: u32) -> (Vec<u8>, u64) {
+fn encode_block4(data: &[u8], rolz: &mut RolzCodec, block_size: u32, checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
     let block_len = data.len();
 
     if block_len <= SMALL_BLOCK_SIZE {
-        return finish_block(data.to_vec(), block_len, true, 0);
+        return finish_block(data.to_vec(), block_len, true, 0, checksum);
     }
 
     // Stage 1: TEXT (real implementation, see text_codec.rs)
@@ -679,19 +757,20 @@ fn encode_block4(data: &[u8], rolz: &mut RolzCodec, block_size: u32) -> (Vec<u8>
     // form's header alone already makes it bigger than the raw payload, so
     // Go's strict < rule always selects transformed-copy here -- build it
     // directly (post_len > 0 always: blocks are non-empty).
-    finish_block_transformed_copy(&stage6_out, skip_flags, 6)
+    finish_block_transformed_copy(&stage6_out, skip_flags, 6, checksum)
 }
 
 /// Encodes `data` as a complete level-5 (TEXT+UTF+BWT+RANK+ZRLT & ANS0)
 /// kanzi bitstream. All stages are fully ported.
-pub fn encode_level5(data: &[u8], block_size: u32) -> Vec<u8> {
+pub fn encode_level5(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
     let mut bw = BitWriter::new();
     let transform_type: u64 = (TEXT_TYPE << BFF_MAX_SHIFT)
         | (UTF_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT))
         | (BWT_TYPE << (BFF_MAX_SHIFT - 2 * BFF_ONE_SHIFT))
         | (RANK_TYPE << (BFF_MAX_SHIFT - 3 * BFF_ONE_SHIFT))
         | (ZRLT_TYPE << (BFF_MAX_SHIFT - 4 * BFF_ONE_SHIFT));
-    write_stream_header(&mut bw, ANS0_ENTROPY, transform_type, block_size);
+    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
+    write_stream_header(&mut bw, ANS0_ENTROPY, transform_type, block_size, &hasher);
 
     let mut bwt = Bwt::new();
     let mut offset = 0usize;
@@ -699,7 +778,7 @@ pub fn encode_level5(data: &[u8], block_size: u32) -> Vec<u8> {
     while offset < data.len() {
         let len = block_size.min((data.len() - offset) as u32) as usize;
         let block = &data[offset..offset + len];
-        let (encoded_block, written) = encode_block5(block, &mut bwt, block_size);
+        let (encoded_block, written) = encode_block5(block, &mut bwt, block_size, hasher.checksum(block));
         write_framed_block(&mut bw, &encoded_block, written);
         offset += len;
     }
@@ -710,11 +789,11 @@ pub fn encode_level5(data: &[u8], block_size: u32) -> Vec<u8> {
     bw.finish()
 }
 
-fn encode_block5(data: &[u8], bwt: &mut Bwt, block_size: u32) -> (Vec<u8>, u64) {
+fn encode_block5(data: &[u8], bwt: &mut Bwt, block_size: u32, checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
     let block_len = data.len();
 
     if block_len <= SMALL_BLOCK_SIZE {
-        return finish_block(data.to_vec(), block_len, true, 0);
+        return finish_block(data.to_vec(), block_len, true, 0, checksum);
     }
 
     // Stage 1: TEXT (codec 2 covers ANS0, like HUFFMAN/NONE; see Factory.go).
@@ -788,20 +867,21 @@ fn encode_block5(data: &[u8], bwt: &mut Bwt, block_size: u32) -> (Vec<u8>, u64) 
     aenc.write(&stage5_out, &mut ebw);
     let entropy_payload = ebw.finish_with_len();
 
-    let normal = finish_block_multi(entropy_payload, stage5_out.len(), false, skip_flags, 5);
-    maybe_transformed_copy(normal, &stage5_out, skip_flags, 5)
+    let normal = finish_block_multi(entropy_payload, stage5_out.len(), false, skip_flags, 5, checksum);
+    maybe_transformed_copy(normal, &stage5_out, skip_flags, 5, checksum)
 }
 
 /// Encodes `data` as a complete level-6 (TEXT+UTF+BWT+SRT+ZRLT & FPAQ)
 /// kanzi bitstream. All stages are fully ported.
-pub fn encode_level6(data: &[u8], block_size: u32) -> Vec<u8> {
+pub fn encode_level6(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
     let mut bw = BitWriter::new();
     let transform_type: u64 = (TEXT_TYPE << BFF_MAX_SHIFT)
         | (UTF_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT))
         | (BWT_TYPE << (BFF_MAX_SHIFT - 2 * BFF_ONE_SHIFT))
         | (SRT_TYPE << (BFF_MAX_SHIFT - 3 * BFF_ONE_SHIFT))
         | (ZRLT_TYPE << (BFF_MAX_SHIFT - 4 * BFF_ONE_SHIFT));
-    write_stream_header(&mut bw, FPAQ_ENTROPY, transform_type, block_size);
+    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
+    write_stream_header(&mut bw, FPAQ_ENTROPY, transform_type, block_size, &hasher);
 
     let mut bwt = Bwt::new();
     let mut offset = 0usize;
@@ -809,7 +889,7 @@ pub fn encode_level6(data: &[u8], block_size: u32) -> Vec<u8> {
     while offset < data.len() {
         let len = block_size.min((data.len() - offset) as u32) as usize;
         let block = &data[offset..offset + len];
-        let (encoded_block, written) = encode_block6(block, &mut bwt, block_size);
+        let (encoded_block, written) = encode_block6(block, &mut bwt, block_size, hasher.checksum(block));
         write_framed_block(&mut bw, &encoded_block, written);
         offset += len;
     }
@@ -820,11 +900,11 @@ pub fn encode_level6(data: &[u8], block_size: u32) -> Vec<u8> {
     bw.finish()
 }
 
-fn encode_block6(data: &[u8], bwt: &mut Bwt, block_size: u32) -> (Vec<u8>, u64) {
+fn encode_block6(data: &[u8], bwt: &mut Bwt, block_size: u32, checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
     let block_len = data.len();
 
     if block_len <= SMALL_BLOCK_SIZE {
-        return finish_block(data.to_vec(), block_len, true, 0);
+        return finish_block(data.to_vec(), block_len, true, 0, checksum);
     }
 
     // Stage 1: TEXT (codec 1 for FPAQ/CM/TPAQ; see Factory.go newToken).
@@ -905,33 +985,30 @@ fn encode_block6(data: &[u8], bwt: &mut Bwt, block_size: u32) -> (Vec<u8>, u64) 
     fenc.dispose(&mut ebw);
     let entropy_payload = ebw.finish_with_len();
 
-    let normal = finish_block_multi(entropy_payload, stage5_out.len(), false, skip_flags, 5);
-    maybe_transformed_copy(normal, &stage5_out, skip_flags, 5)
+    let normal = finish_block_multi(entropy_payload, stage5_out.len(), false, skip_flags, 5, checksum);
+    maybe_transformed_copy(normal, &stage5_out, skip_flags, 5, checksum)
 }
 
-/// Encodes `data` as a complete level-7 (LZP+TEXT+UTF+BWT+LZP & CM)
-/// kanzi bitstream. LZP appears twice in the sequence (slot0 and slot4),
-/// each with its own fresh `LzpCodec` instance/hash table, matching Go's
-/// "fresh transform instance per slot" behavior even when the same type
-/// repeats.
-pub fn encode_level7(data: &[u8], block_size: u32) -> Vec<u8> {
+/// Encodes `data` as a complete level-0 (NONE&NONE, "store") kanzi
+/// bitstream. transform_type is 0 (all 8 slots NONE); Go's Factory still
+/// keeps one forced identity slot in the sequence (nbtr==0 -> nbtr=1), so
+/// every block's skip_flags shows that one slot as "succeeded" (0x7F) --
+/// there's nothing to skip since it's a pure no-op. Every block above
+/// SMALL_BLOCK_SIZE ends up re-emitted as a "transformed copy" of the raw
+/// bytes: NONE entropy's header-plus-payload total is never smaller than
+/// the raw payload alone, so Go's strict `<` re-emit rule always fires
+/// here (same reasoning as level 4's ROLZ-with-NONE-entropy path).
+pub fn encode_level0(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
+    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
     let mut bw = BitWriter::new();
-    let transform_type: u64 = (LZP_TYPE << BFF_MAX_SHIFT)
-        | (TEXT_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT))
-        | (UTF_TYPE << (BFF_MAX_SHIFT - 2 * BFF_ONE_SHIFT))
-        | (BWT_TYPE << (BFF_MAX_SHIFT - 3 * BFF_ONE_SHIFT))
-        | (LZP_TYPE << (BFF_MAX_SHIFT - 4 * BFF_ONE_SHIFT));
-    write_stream_header(&mut bw, CM_ENTROPY, transform_type, block_size);
+    write_stream_header(&mut bw, NONE_ENTROPY, 0, block_size, &hasher);
 
-    let mut lzp0 = LzpCodec::new();
-    let mut bwt = Bwt::new();
-    let mut lzp1 = LzpCodec::new();
     let mut offset = 0usize;
 
     while offset < data.len() {
         let len = block_size.min((data.len() - offset) as u32) as usize;
         let block = &data[offset..offset + len];
-        let (encoded_block, written) = encode_block7(block, &mut lzp0, &mut bwt, &mut lzp1, block_size);
+        let (encoded_block, written) = encode_block0(block, hasher.checksum(block));
         write_framed_block(&mut bw, &encoded_block, written);
         offset += len;
     }
@@ -942,11 +1019,65 @@ pub fn encode_level7(data: &[u8], block_size: u32) -> Vec<u8> {
     bw.finish()
 }
 
-fn encode_block7(data: &[u8], lzp0: &mut LzpCodec, bwt: &mut Bwt, lzp1: &mut LzpCodec, block_size: u32) -> (Vec<u8>, u64) {
+fn encode_block0(data: &[u8], checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
     let block_len = data.len();
 
     if block_len <= SMALL_BLOCK_SIZE {
-        return finish_block(data.to_vec(), block_len, true, 0);
+        return finish_block(data.to_vec(), block_len, true, 0, checksum);
+    }
+
+    let skip_flags: u8 = 0x7F;
+    let normal = finish_block_multi((data.to_vec(), (block_len as u64) * 8), block_len, false, skip_flags, 1, checksum);
+    maybe_transformed_copy(normal, data, skip_flags, 1, checksum)
+}
+
+/// Encodes `data` as a complete level-7 (LZP+TEXT+UTF+BWT+LZP & CM)
+/// kanzi bitstream. LZP appears twice in the sequence (slot0 and slot4),
+/// each with its own fresh `LzpCodec` instance/hash table, matching Go's
+/// "fresh transform instance per slot" behavior even when the same type
+/// repeats.
+pub fn encode_level7(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
+    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
+    let mut bw = BitWriter::new();
+    let transform_type: u64 = (LZP_TYPE << BFF_MAX_SHIFT)
+        | (TEXT_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT))
+        | (UTF_TYPE << (BFF_MAX_SHIFT - 2 * BFF_ONE_SHIFT))
+        | (BWT_TYPE << (BFF_MAX_SHIFT - 3 * BFF_ONE_SHIFT))
+        | (LZP_TYPE << (BFF_MAX_SHIFT - 4 * BFF_ONE_SHIFT));
+    write_stream_header(&mut bw, CM_ENTROPY, transform_type, block_size, &hasher);
+
+    let mut lzp0 = LzpCodec::new();
+    let mut bwt = Bwt::new();
+    let mut lzp1 = LzpCodec::new();
+    let mut offset = 0usize;
+
+    while offset < data.len() {
+        let len = block_size.min((data.len() - offset) as u32) as usize;
+        let block = &data[offset..offset + len];
+        let (encoded_block, written) =
+            encode_block7(block, &mut lzp0, &mut bwt, &mut lzp1, block_size, hasher.checksum(block));
+        write_framed_block(&mut bw, &encoded_block, written);
+        offset += len;
+    }
+
+    bw.write_bits(0, 5);
+    bw.write_bits(0, 3);
+
+    bw.finish()
+}
+
+fn encode_block7(
+    data: &[u8],
+    lzp0: &mut LzpCodec,
+    bwt: &mut Bwt,
+    lzp1: &mut LzpCodec,
+    block_size: u32,
+    checksum: Option<(u64, u8)>,
+) -> (Vec<u8>, u64) {
+    let block_len = data.len();
+
+    if block_len <= SMALL_BLOCK_SIZE {
+        return finish_block(data.to_vec(), block_len, true, 0, checksum);
     }
 
     // Stage 1: LZP (real implementation, see lzp.rs)
@@ -1011,25 +1142,26 @@ fn encode_block7(data: &[u8], lzp0: &mut LzpCodec, bwt: &mut Bwt, lzp1: &mut Lzp
     cenc.dispose(&mut ebw);
     let entropy_payload = ebw.finish_with_len();
 
-    let normal = finish_block_multi(entropy_payload, stage5_out.len(), false, skip_flags, 5);
-    maybe_transformed_copy(normal, &stage5_out, skip_flags, 5)
+    let normal = finish_block_multi(entropy_payload, stage5_out.len(), false, skip_flags, 5, checksum);
+    maybe_transformed_copy(normal, &stage5_out, skip_flags, 5, checksum)
 }
 
 /// Encodes `data` as a complete level-8 (EXE+RLT+TEXT+UTF+DNA & TPAQ)
 /// kanzi bitstream. All stages are fully ported.
-pub fn encode_level8(data: &[u8], block_size: u32) -> Vec<u8> {
-    encode_level89(data, block_size, false)
+pub fn encode_level8(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
+    encode_level89(data, block_size, false, ck_size)
 }
 
 /// Encodes `data` as a complete level-9 (EXE+RLT+TEXT+UTF+DNA & TPAQX)
 /// kanzi bitstream. Identical transform chain to level 8 -- only the
 /// entropy stage differs (TPAQX: a second SSE stage plus a 7th mixer
 /// input from an extra hashed context; see tpaq.rs).
-pub fn encode_level9(data: &[u8], block_size: u32) -> Vec<u8> {
-    encode_level89(data, block_size, true)
+pub fn encode_level9(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
+    encode_level89(data, block_size, true, ck_size)
 }
 
-fn encode_level89(data: &[u8], block_size: u32, extra: bool) -> Vec<u8> {
+fn encode_level89(data: &[u8], block_size: u32, extra: bool, ck_size: u64) -> Vec<u8> {
+    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
     let mut bw = BitWriter::new();
     let transform_type: u64 = (EXE_TYPE << BFF_MAX_SHIFT)
         | (RLT_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT))
@@ -1037,14 +1169,14 @@ fn encode_level89(data: &[u8], block_size: u32, extra: bool) -> Vec<u8> {
         | (UTF_TYPE << (BFF_MAX_SHIFT - 3 * BFF_ONE_SHIFT))
         | (DNA_TYPE << (BFF_MAX_SHIFT - 4 * BFF_ONE_SHIFT));
     let entropy_type = if extra { TPAQX_ENTROPY } else { TPAQ_ENTROPY };
-    write_stream_header(&mut bw, entropy_type, transform_type, block_size);
+    write_stream_header(&mut bw, entropy_type, transform_type, block_size, &hasher);
 
     let mut offset = 0usize;
 
     while offset < data.len() {
         let len = block_size.min((data.len() - offset) as u32) as usize;
         let block = &data[offset..offset + len];
-        let (encoded_block, written) = encode_block89(block, block_size, extra);
+        let (encoded_block, written) = encode_block89(block, block_size, extra, hasher.checksum(block));
         write_framed_block(&mut bw, &encoded_block, written);
         offset += len;
     }
@@ -1055,11 +1187,11 @@ fn encode_level89(data: &[u8], block_size: u32, extra: bool) -> Vec<u8> {
     bw.finish()
 }
 
-fn encode_block89(data: &[u8], block_size: u32, extra: bool) -> (Vec<u8>, u64) {
+fn encode_block89(data: &[u8], block_size: u32, extra: bool, checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
     let block_len = data.len();
 
     if block_len <= SMALL_BLOCK_SIZE {
-        return finish_block(data.to_vec(), block_len, true, 0);
+        return finish_block(data.to_vec(), block_len, true, 0, checksum);
     }
 
     // Stage 1: EXE (real implementation, see exe.rs). First in the chain,
@@ -1129,8 +1261,8 @@ fn encode_block89(data: &[u8], block_size: u32, extra: bool) -> (Vec<u8>, u64) {
     tenc.dispose(&mut ebw);
     let entropy_payload = ebw.finish_with_len();
 
-    let normal = finish_block_multi(entropy_payload, stage5_out.len(), false, skip_flags, 5);
-    maybe_transformed_copy(normal, &stage5_out, skip_flags, 5)
+    let normal = finish_block_multi(entropy_payload, stage5_out.len(), false, skip_flags, 5, checksum);
+    maybe_transformed_copy(normal, &stage5_out, skip_flags, 5, checksum)
 }
 
 fn log2_no_check(x: u32) -> u32 {
@@ -1157,6 +1289,7 @@ struct StreamHeader {
     entropy_type: u64,
     transform_type: u64,
     block_size: u32,
+    hasher: Hasher,
 }
 
 fn read_stream_header(br: &mut BitReader) -> Result<StreamHeader, String> {
@@ -1176,13 +1309,12 @@ fn read_stream_header(br: &mut BitReader) -> Result<StreamHeader, String> {
     }
 
     let ck_size = br.read_bits(2);
-
-    if ck_size != 0 {
-        return Err(format!(
-            "Block checksums (ckSize={}) are not supported by this decoder",
+    let hasher = Hasher::new(ck_size).map_err(|_| {
+        format!(
+            "Invalid bitstream, incorrect checksum size: {} (ckSize must be 0, 1, or 2)",
             ck_size
-        ));
-    }
+        )
+    })?;
 
     let entropy_type = br.read_bits(5);
     let transform_type = br.read_bits(48);
@@ -1228,6 +1360,7 @@ fn read_stream_header(br: &mut BitReader) -> Result<StreamHeader, String> {
         entropy_type,
         transform_type,
         block_size,
+        hasher,
     })
 }
 
@@ -1245,6 +1378,12 @@ struct BlockHeader {
 /// skipFlags byte), exactly as Go's `tSeq.Len()` does, without needing a
 /// generic Transform/Sequence abstraction.
 fn num_transforms_for(transform_type: u64) -> Result<usize, String> {
+    if transform_type == 0 {
+        // Level 0 (store): Go's Factory keeps one forced identity slot
+        // even when the whole transform_type is NONE (nbtr==0 -> nbtr=1).
+        return Ok(1);
+    }
+
     let l1_type: u64 = LZX_TYPE << BFF_MAX_SHIFT;
     let l2_type: u64 = (DNA_TYPE << BFF_MAX_SHIFT) | (LZ_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT));
     let l3_type: u64 = (TEXT_TYPE << BFF_MAX_SHIFT)
@@ -1397,6 +1536,12 @@ fn apply_inverse_transforms(
     block_size: u32,
     entropy_tpaqx: bool,
 ) -> Result<Vec<u8>, String> {
+    if transform_type == 0 {
+        // Level 0 (store): the one forced slot is NONE_TYPE, a pure
+        // identity -- always a no-op regardless of skip_flags.
+        return Ok(buffer.to_vec());
+    }
+
     let l1_type: u64 = LZX_TYPE << BFF_MAX_SHIFT;
     let l2_type: u64 = (DNA_TYPE << BFF_MAX_SHIFT) | (LZ_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT));
     let l3_type: u64 = (TEXT_TYPE << BFF_MAX_SHIFT)
@@ -1855,13 +2000,45 @@ fn decode_block(
         return Err(format!("Invalid compressed block size: {}", pre_len));
     }
 
-    if block_header.raw_copy {
+    // The payload checksum (if any) sits right after the block header and
+    // before the payload, in every block shape (raw copy, transformed
+    // copy, and normal entropy-coded) -- see Go's "Extract checksum from
+    // bit stream" step, which runs unconditionally before dispatching on
+    // rawCopy/transformedCopy/normal.
+    let expected_checksum: Option<u64> = match &hdr.hasher {
+        Hasher::None => None,
+        Hasher::H32(_) => Some(br.read_bits(32)),
+        Hasher::H64(_) => Some(br.read_bits(64)),
+    };
+
+    let decoded = if block_header.raw_copy {
         // No transform, no entropy: the payload is the final bytes as-is.
         let mut payload = vec![0u8; pre_len];
         br.read_array(&mut payload, 8 * pre_len);
-        return Ok(payload);
+        payload
+    } else {
+        decode_block_payload(br, &block_header, hdr, pre_len)?
+    };
+
+    if let Some(expected) = expected_checksum {
+        let actual = match &hdr.hasher {
+            Hasher::None => unreachable!(),
+            Hasher::H32(h) => h.hash(&decoded) as u64,
+            Hasher::H64(h) => h.hash(&decoded),
+        };
+
+        if actual != expected {
+            return Err(format!(
+                "Corrupted bitstream: expected checksum {:#x}, found {:#x}",
+                expected, actual
+            ));
+        }
     }
 
+    Ok(decoded)
+}
+
+fn decode_block_payload(br: &mut BitReader, block_header: &BlockHeader, hdr: &StreamHeader, pre_len: usize) -> Result<Vec<u8>, String> {
     let mut buffer = vec![0u8; pre_len];
 
     if block_header.transformed_copy {
@@ -1949,76 +2126,25 @@ pub fn decode(data: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Encodes one block's local (byte-aligned) buffer:
 /// [mode:1][preTransformLength: dataSize bytes][headerChecksum:1][payload].
-fn encode_block(data: &[u8], lzx: &mut LzxCodec) -> Vec<u8> {
+fn encode_block(data: &[u8], lzx: &mut LzxCodec, checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
     let block_len = data.len();
-    let is_copy;
-    let post_transform_len: usize;
-    let payload: Vec<u8>;
-    let skip_nibble: u8; // low 4 bits contributed by transform SkipFlags()>>4
 
     if block_len <= SMALL_BLOCK_SIZE {
-        is_copy = true;
-        post_transform_len = block_len;
-        payload = data.to_vec();
-        skip_nibble = 0x07; // forced NONE transform "succeeds"
-    } else {
-        let mut dst = vec![0u8; LzxCodec::max_encoded_len(block_len)];
+        return finish_block(data.to_vec(), block_len, true, 0, checksum);
+    }
 
-        match lzx.forward(data, &mut dst, lzx::MIN_MATCH4) {
-            Ok((_, n)) => {
-                dst.truncate(n);
-                is_copy = false;
-                post_transform_len = n;
-                payload = dst;
-                skip_nibble = 0x07; // SkipFlags() = 0x7F -> >>4 = 0x07
-            }
-            Err(_) => {
-                is_copy = false;
-                post_transform_len = block_len;
-                payload = data.to_vec();
-                skip_nibble = 0x0F; // SkipFlags() = 0xFF (transform declined) -> >>4 = 0x0F
-            }
+    let mut dst = vec![0u8; LzxCodec::max_encoded_len(block_len)];
+    let (payload, skip_bit): (Vec<u8>, u8) = match lzx.forward(data, &mut dst, lzx::MIN_MATCH4) {
+        Ok((_, n)) => {
+            dst.truncate(n);
+            (dst, 0)
         }
-    }
+        Err(_) => (data.to_vec(), 1),
+    };
 
-    let data_size = log2_bytes_needed(post_transform_len as u32);
-    let mut mode: u8 = (((data_size - 1) & 0x03) as u8) << 5;
-
-    if is_copy {
-        mode |= 0x80;
-    }
-
-    mode |= skip_nibble;
-
-    let header_skip_flags: u8 = if is_copy { 0 } else { (mode << 4) | 0x0F };
-
-    let mut buf = Vec::with_capacity(2 + data_size as usize + payload.len());
-    buf.push(mode);
-
-    for i in (0..data_size).rev() {
-        buf.push(((post_transform_len as u64 >> (8 * i)) & 0xFF) as u8);
-    }
-
-    let checksum_index = buf.len();
-    buf.push(0); // placeholder, patched below
-    buf.extend_from_slice(&payload);
-
-    let written = buf.len() as u64 * 8;
-    let mut cksum = HASH.wrapping_mul(0x01030507u32);
-    cksum = mix32(cksum, HASH, mode as u32);
-    cksum = mix32(cksum, HASH, header_skip_flags as u32);
-    cksum = mix32(cksum, HASH, post_transform_len as u32);
-    cksum = mix32(cksum, HASH, (written >> 32) as u32);
-    cksum = mix32(cksum, HASH, written as u32);
-    cksum = (cksum >> 23) ^ (cksum >> 3);
-    buf[checksum_index] = cksum as u8;
-
-    if is_copy {
-        return buf;
-    }
-
+    let skip_flags = (skip_bit << 7) | 0x7F;
+    let normal = finish_block_multi((payload.clone(), payload.len() as u64 * 8), payload.len(), false, skip_flags, 1, checksum);
     // With NONE entropy the entropy stage never shrinks the payload, so Go
     // always re-emits such blocks in transformed-copy form (strict < rule).
-    let skip_flags = (skip_nibble << 4) | 0x0F;
-    maybe_transformed_copy((buf, written), &payload, skip_flags, 1).0
+    maybe_transformed_copy(normal, &payload, skip_flags, 1, checksum)
 }

@@ -24,6 +24,7 @@ mod text_codec;
 mod text_codec1;
 mod tpaq;
 mod utf;
+mod xxhash;
 mod zrlt;
 
 use bitio::BitWriter;
@@ -51,7 +52,8 @@ fn main() {
                 .map(|s| s.parse().unwrap())
                 .unwrap_or(4 * 1024 * 1024);
             let data = fs::read(&args[2]).expect("read input");
-            let out = container::encode_level1(&data, block_size);
+            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
+            let out = container::encode_level1(&data, block_size, ck_size);
             fs::write(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
@@ -66,7 +68,8 @@ fn main() {
                 .map(|s| s.parse().unwrap())
                 .unwrap_or(4 * 1024 * 1024);
             let data = fs::read(&args[2]).expect("read input");
-            let out = container::encode_level2(&data, block_size);
+            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
+            let out = container::encode_level2(&data, block_size, ck_size);
             fs::write(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
@@ -95,7 +98,8 @@ fn main() {
                 .map(|s| s.parse().unwrap())
                 .unwrap_or(4 * 1024 * 1024);
             let data = fs::read(&args[2]).expect("read input");
-            let out = container::encode_level3(&data, block_size);
+            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
+            let out = container::encode_level3(&data, block_size, ck_size);
             fs::write(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
@@ -212,6 +216,14 @@ fn main() {
                 }
                 std::process::exit(1);
             }
+        }
+        "xxhashtest" => {
+            let data = fs::read(&args[2]).expect("read input");
+            let seed32: u32 = args.get(3).map(|s| s.parse().unwrap()).unwrap_or(0);
+            let seed64: u64 = args.get(4).map(|s| s.parse().unwrap()).unwrap_or(0);
+            let h32 = xxhash::XxHash32::new(seed32).hash(&data);
+            let h64 = xxhash::XxHash64::new(seed64).hash(&data);
+            println!("xxh32={:#010x} xxh64={:#018x}", h32, h64);
         }
         "saistest" => {
             // Brute-force cross-check of sais::suffix_array against a naive
@@ -368,7 +380,8 @@ fn main() {
                 .map(|s| s.parse().unwrap())
                 .unwrap_or(4 * 1024 * 1024);
             let data = fs::read(&args[2]).expect("read input");
-            let out = container::encode_level9(&data, block_size);
+            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
+            let out = container::encode_level9(&data, block_size, ck_size);
             fs::write(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
@@ -383,7 +396,24 @@ fn main() {
                 .map(|s| s.parse().unwrap())
                 .unwrap_or(4 * 1024 * 1024);
             let data = fs::read(&args[2]).expect("read input");
-            let out = container::encode_level8(&data, block_size);
+            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
+            let out = container::encode_level8(&data, block_size, ck_size);
+            fs::write(&args[3], &out).expect("write output");
+            println!(
+                "encoded {} -> {} bytes ({:.2}%)",
+                data.len(),
+                out.len(),
+                100.0 * out.len() as f64 / data.len() as f64
+            );
+        }
+        "encode0" => {
+            let block_size: u32 = args
+                .get(4)
+                .map(|s| s.parse().unwrap())
+                .unwrap_or(4 * 1024 * 1024);
+            let data = fs::read(&args[2]).expect("read input");
+            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
+            let out = container::encode_level0(&data, block_size, ck_size);
             fs::write(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
@@ -398,7 +428,8 @@ fn main() {
                 .map(|s| s.parse().unwrap())
                 .unwrap_or(4 * 1024 * 1024);
             let data = fs::read(&args[2]).expect("read input");
-            let out = container::encode_level7(&data, block_size);
+            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
+            let out = container::encode_level7(&data, block_size, ck_size);
             fs::write(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
@@ -413,7 +444,8 @@ fn main() {
                 .map(|s| s.parse().unwrap())
                 .unwrap_or(4 * 1024 * 1024);
             let data = fs::read(&args[2]).expect("read input");
-            let out = container::encode_level6(&data, block_size);
+            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
+            let out = container::encode_level6(&data, block_size, ck_size);
             fs::write(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
@@ -428,7 +460,8 @@ fn main() {
                 .map(|s| s.parse().unwrap())
                 .unwrap_or(4 * 1024 * 1024);
             let data = fs::read(&args[2]).expect("read input");
-            let out = container::encode_level5(&data, block_size);
+            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
+            let out = container::encode_level5(&data, block_size, ck_size);
             fs::write(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
@@ -443,7 +476,8 @@ fn main() {
                 .map(|s| s.parse().unwrap())
                 .unwrap_or(4 * 1024 * 1024);
             let data = fs::read(&args[2]).expect("read input");
-            let out = container::encode_level4(&data, block_size);
+            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
+            let out = container::encode_level4(&data, block_size, ck_size);
             fs::write(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
