@@ -5,7 +5,17 @@ name = "rust_kanzi"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "kanzi"          # Python module will be called `kanzi`
+crate-type = ["cdylib"]
+
 [profile.release]
 opt-level = 3
 
 [dependencies]
+libsais = { version = "0.2", default-features = false, optional = true }
+pyo3 = { version = "0.26", features = ["extension-module"] }
+
+[features]
+default = []
+fast-sa = ["dep:libsais"]
