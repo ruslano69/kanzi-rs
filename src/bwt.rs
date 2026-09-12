@@ -11,10 +11,25 @@
 // DivSufSort on huge blocks; that is the known cost of the smaller port.
 //
 // Inverse ports inverseMergeTPSI exactly (single- and 8-chunk walks,
-// sequential -- jobs=1 like this project's single-job container).
-// inverseBiPSIv2 (single blocks > 4MB) is NOT ported and fails loudly;
-// only the v6+ block header layout is supported (this project is v7-only,
-// and Go takes the same branch for versions 6 and 7).
+// sequential -- jobs=1 like this project's single-job container). Go
+// switches to inverseBiPSIv2 above 4MB purely for performance -- both
+// algorithms compute the same mathematically unique inverse permutation
+// (given a correct primary index), so any block MergeTPSI can pack
+// correctly decodes identically to what BiPSIv2 would have produced.
+// MergeTPSI's own limit is its (index<<8)|value packing into one i32,
+// which needs `index` (up to count-1) to fit in 24 bits, i.e. count <=
+// 1<<24 (16 MiB) -- covers every level 5/6/7 default block size (4/8/16
+// MiB). Go's comment on this packing says the same 2^24 bound but Go
+// reads it back with an arithmetic (sign-propagating) shift, which
+// actually only stays correct up to count <= 1<<23 since Go never
+// exercises this path above its own 4MB algorithm-choice threshold; this
+// port reads it back with a logical (unsigned) shift instead, so it is
+// not bound by that narrower accidental limit and safely spans the full
+// 1<<24 the packing scheme was designed for. inverseBiPSIv2 itself (a
+// different, more memory-efficient algorithm needed only above 1<<24) is
+// NOT ported and fails loudly. Only the v6+ block header layout is
+// supported (this project is v7-only, and Go takes the same branch for
+// versions 6 and 7).
 //
 // Wire format (BWTBlockCodec, v6+): [mode:1][primary indexes]
 // [bwt data], mode = (logChunks<<2)|(pIndexSize-1); the BWT payload itself
@@ -24,7 +39,9 @@ use crate::logtables::TAB_LOG2;
 
 pub const BWT_MAX_HEADER_SIZE: usize = 1 + 8 * 4;
 const BWT_BLOCK_SIZE_THRESHOLD1: usize = 256;
-const BWT_BLOCK_SIZE_THRESHOLD2: usize = 4 * 1024 * 1024;
+// True correctness bound of inverseMergeTPSI's (index<<8)|value packing
+// (see the module doc comment) -- NOT Go's 4MB algorithm-choice threshold.
+const BWT_MERGE_TPSI_MAX: usize = 1 << 24;
 
 pub fn max_encoded_len(src_len: usize) -> usize {
     src_len + BWT_MAX_HEADER_SIZE
@@ -357,8 +374,8 @@ impl Bwt {
         dst: &mut [u8],
         count: usize,
     ) -> Result<(usize, usize), &'static str> {
-        if count > BWT_BLOCK_SIZE_THRESHOLD2 {
-            return Err("BWT inverse transform failed: block too big (BiPSIv2 not ported)");
+        if count > BWT_MERGE_TPSI_MAX {
+            return Err("BWT inverse transform failed: block too big (BiPSIv2 not ported, limit is 16 MiB)");
         }
 
         if count > dst.len() {
@@ -382,8 +399,10 @@ impl Bwt {
 
         let data = &mut self.buffer[..count];
 
-        // Counting sort into packed (index, value) entries. Blocks < 2^24 by
-        // construction (count <= 4MB here), so (i<<8)|val fits i32.
+        // Counting sort into packed (index, value) entries: (i<<8)|val,
+        // i up to count-1 < 2^24 (checked above). Read back with a logical
+        // shift (see module doc) so the full 2^24 range round-trips
+        // correctly regardless of the packed value's sign as an i32.
         {
             let mut buckets = [0i32; 256];
 
@@ -421,7 +440,7 @@ impl Bwt {
             for i in 0..count {
                 let ptr = data[t as usize];
                 dst[i] = ptr as u8;
-                t = ptr >> 8;
+                t = ((ptr as u32) >> 8) as i32;
             }
         } else {
             let mut ck_size = count >> 3;
@@ -458,53 +477,53 @@ impl Bwt {
             while n < end {
                 let ptr0 = data[t[0] as usize];
                 d0[n] = ptr0 as u8;
-                t[0] = ptr0 >> 8;
+                t[0] = ((ptr0 as u32) >> 8) as i32;
                 let ptr1 = data[t[1] as usize];
                 d1[n] = ptr1 as u8;
-                t[1] = ptr1 >> 8;
+                t[1] = ((ptr1 as u32) >> 8) as i32;
                 let ptr2 = data[t[2] as usize];
                 d2[n] = ptr2 as u8;
-                t[2] = ptr2 >> 8;
+                t[2] = ((ptr2 as u32) >> 8) as i32;
                 let ptr3 = data[t[3] as usize];
                 d3[n] = ptr3 as u8;
-                t[3] = ptr3 >> 8;
+                t[3] = ((ptr3 as u32) >> 8) as i32;
                 let ptr4 = data[t[4] as usize];
                 d4[n] = ptr4 as u8;
-                t[4] = ptr4 >> 8;
+                t[4] = ((ptr4 as u32) >> 8) as i32;
                 let ptr5 = data[t[5] as usize];
                 d5[n] = ptr5 as u8;
-                t[5] = ptr5 >> 8;
+                t[5] = ((ptr5 as u32) >> 8) as i32;
                 let ptr6 = data[t[6] as usize];
                 d6[n] = ptr6 as u8;
-                t[6] = ptr6 >> 8;
+                t[6] = ((ptr6 as u32) >> 8) as i32;
                 let ptr7 = data[t[7] as usize];
                 d7[n] = ptr7 as u8;
-                t[7] = ptr7 >> 8;
+                t[7] = ((ptr7 as u32) >> 8) as i32;
                 n += 1;
             }
 
             while n < ck_size {
                 let ptr0 = data[t[0] as usize];
                 d0[n] = ptr0 as u8;
-                t[0] = ptr0 >> 8;
+                t[0] = ((ptr0 as u32) >> 8) as i32;
                 let ptr1 = data[t[1] as usize];
                 d1[n] = ptr1 as u8;
-                t[1] = ptr1 >> 8;
+                t[1] = ((ptr1 as u32) >> 8) as i32;
                 let ptr2 = data[t[2] as usize];
                 d2[n] = ptr2 as u8;
-                t[2] = ptr2 >> 8;
+                t[2] = ((ptr2 as u32) >> 8) as i32;
                 let ptr3 = data[t[3] as usize];
                 d3[n] = ptr3 as u8;
-                t[3] = ptr3 >> 8;
+                t[3] = ((ptr3 as u32) >> 8) as i32;
                 let ptr4 = data[t[4] as usize];
                 d4[n] = ptr4 as u8;
-                t[4] = ptr4 >> 8;
+                t[4] = ((ptr4 as u32) >> 8) as i32;
                 let ptr5 = data[t[5] as usize];
                 d5[n] = ptr5 as u8;
-                t[5] = ptr5 >> 8;
+                t[5] = ((ptr5 as u32) >> 8) as i32;
                 let ptr6 = data[t[6] as usize];
                 d6[n] = ptr6 as u8;
-                t[6] = ptr6 >> 8;
+                t[6] = ((ptr6 as u32) >> 8) as i32;
                 n += 1;
             }
         }
