@@ -79,6 +79,12 @@ compressed = kanzi.compress(data, 6)      # level 0-9
 restored = kanzi.decompress(compressed)
 assert restored == data
 
+# Block size defaults to the same per-level value the reference kanzi CLI
+# uses (4 MiB for levels 0-5, 8 MiB for level 6, 16 MiB for levels 7-8,
+# 32 MiB for level 9); override it explicitly if you want a fixed size
+# regardless of level, matching the CLI's -b/--block:
+compressed = kanzi.compress(data, 8, block_size=4 * 1024 * 1024)
+
 kanzi.compress_to_file("input.bin", 6)    # writes input.bin.kanzi
 kanzi.decompress_to_file("input.bin.kanzi")
 ```

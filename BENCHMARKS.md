@@ -1,7 +1,8 @@
 # Benchmarks
 
-kanzi-rs (this repo), commit history through the RLT/LZX fixes and the
-bounds-check-elimination performance pass.
+kanzi-rs (this repo), commit history through the RLT/LZX fixes, the
+bounds-check-elimination performance pass, and the per-level default
+block-size fix described below.
 
 ## silesia.tar
 
@@ -10,26 +11,25 @@ non-ECC RAM, Windows 10, rustc 1.98.1, kanzi-rs 0.1.0.
 
 Download at http://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip
 
-Encoding and decoding are parallelized across blocks (default 4 MiB block
-size) using all available hardware threads (`std::thread::available_parallelism`,
-32 here) -- these numbers reflect full-machine throughput, not a single core,
-and are not directly comparable to a run pinned to fewer threads. Sizes below
-are exact byte counts from the CLI (`encodeN`/`decode`); the encoding/decoding
-times come from `examples/benchmark.py`'s MB/s figures (`--repeats 1`).
+Encoding and decoding are parallelized across blocks using all available
+hardware threads (`std::thread::available_parallelism`, 32 here) -- these
+numbers reflect full-machine throughput, not a single core. Block size is
+this project's per-level default (see below); sizes are exact byte counts,
+timings from a single `--repeats 1` pass.
 
 | Level | Encoding (ms) | Decoding (ms) | Size |
 |---|---|---|---|
 | Original | | | 211,968,000 |
-| **kanzi-rs -l 0** | 2646 | 2292 | 211,968,474 |
-| **kanzi-rs -l 1** | 2462 | 902 | 79,202,777 |
-| **kanzi-rs -l 2** | 2412 | 812 | 68,646,055 |
-| **kanzi-rs -l 3** | 2549 | 798 | 64,451,851 |
-| **kanzi-rs -l 4** | 2784 | 874 | 61,192,921 |
-| **kanzi-rs -l 5** | 4802 | 998 | 54,021,324 |
-| **kanzi-rs -l 6** | 5016 | 1040 | 50,265,652 |
-| **kanzi-rs -l 7** | 4658 | 1526 | 48,443,535 |
-| **kanzi-rs -l 8** | 8285 | 6542 | 44,465,458 |
-| **kanzi-rs -l 9** | 13941 | 12105 | 42,992,981 |
+| **kanzi-rs -l 0** | 2630 | 2270 | 211,968,474 |
+| **kanzi-rs -l 1** | 2480 | 900 | 79,202,777 |
+| **kanzi-rs -l 2** | 2410 | 800 | 68,646,055 |
+| **kanzi-rs -l 3** | 2510 | 790 | 64,451,851 |
+| **kanzi-rs -l 4** | 2810 | 880 | 61,192,921 |
+| **kanzi-rs -l 5** | 4800 | 1010 | 54,021,324 |
+| **kanzi-rs -l 6** | 5780 | 1110 | 49,515,942 |
+| **kanzi-rs -l 7** | 6380 | 2120 | 47,309,589 |
+| **kanzi-rs -l 8** | 10360 | 8640 | 43,257,955 |
+| **kanzi-rs -l 9** | 21380 | 18930 | 41,857,565 |
 
 Reproduce with:
 
@@ -37,17 +37,13 @@ Reproduce with:
 python examples/benchmark.py --repeats 1 --strict /path/to/silesia.tar
 ```
 
-(`--repeats 1` because a single pass over ~200MB at level 8-9 already takes
-several seconds; `--strict` makes a round-trip mismatch a hard failure
-instead of an inline warning.)
-
 kanzi-go's own README benchmarks the same corpus (as an actual `.tar`) on an
 AMD Ryzen 9950X; that table isn't reproduced here for a head-to-head on
 *speed*, since the CPU generation, job/thread count, and OS all differ
-enough to make a timing comparison misleading. Compressed *size*, on the
-other hand, doesn't depend on any of that -- so here's what the reference
-kanzi implementation (v2.5.1) produces on the exact same `silesia.tar` used
-above, run locally on this machine (`kanzi -c -l N -j 0`):
+enough to make a timing comparison misleading. Compressed *size* doesn't
+depend on any of that, so here's the reference kanzi implementation
+(v2.5.1) on the exact same `silesia.tar`, run locally on this machine
+(`kanzi -c -l N -j 0`, its own per-level default block size):
 
 | Level | kanzi-rs | reference kanzi (v2.5.1) | Difference |
 |---|---|---|---|
@@ -57,101 +53,58 @@ above, run locally on this machine (`kanzi -c -l N -j 0`):
 | 3 | 64,451,851 | 64,436,766 | +0.023% |
 | 4 | 61,192,921 | 61,192,925 | -0.000% |
 | 5 | 54,021,324 | 54,021,328 | -0.000% |
-| 6 | 50,265,652 | 49,515,946 | **+1.514%** |
-| 7 | 48,443,535 | 47,309,593 | **+2.397%** |
-| 8 | 44,465,458 | 43,257,959 | **+2.791%** |
-| 9 | 42,992,981 | 41,857,569 | **+2.713%** |
+| 6 | 49,515,942 | 49,515,946 | -0.000% |
+| 7 | 47,309,589 | 47,309,593 | -0.000% |
+| 8 | 43,257,955 | 43,257,959 | -0.000% |
+| 9 | 41,857,565 | 41,857,569 | -0.000% |
 
-(These are exact byte counts; the size column above doesn't match kanzi-go's
-own README table row for row because that table used a *different*
-`silesia.tar` -- same 12 files, apparently packed slightly differently -- not
-a difference in this port. Levels 1-2 there also differ from the reference
-run *here* for the same reason: different tar, same binary.)
+**Every level now matches the reference to within 4 bytes** (level 0's
++474 is store-mode header overhead; level 3's +0.023% is the one
+remaining, genuinely tiny discrepancy, not yet chased down). The size
+column doesn't match kanzi-go's own README table row for row because that
+table used a *different* `silesia.tar` -- same 12 files, apparently packed
+slightly differently -- not a difference in this port.
 
-**Levels 0-5 are, for practical purposes, exact** (level 3's +0.023% is
-noise-level; everything else matches to single-digit bytes, i.e. this port's
-LZX, DNA+LZ, TEXT+UTF+EXE+PACK+MM+ROLZ, BWT and RANK stages, plus the
-Huffman/ANS0 entropy coders, produce bit-identical results to the reference
-on real-world input at this scale).
+### Postmortem: the block-size bug that looked like a TPAQ bug
 
-**Levels 6-9 have a real, reproducible gap that grows with entropy-model
-sophistication**: FPAQ (level 6, a simple adaptive bit predictor) +1.5%, CM
-(level 7) +2.4%, TPAQ/TPAQX (levels 8-9, context-mixing) +2.7-2.8%. This
-points specifically at the adaptive entropy-coding layer, not at the
-transforms feeding it: SRT (level 6's transform) is a direct, line-by-line
-match against kanzi-go's `SRT.go` (same Shell-sort tie-break, same SWAR run
-collapse), and swapping the suffix-array backend BWT depends on (in-tree
-SA-IS vs. the `fast-sa` feature's libsais) changes *nothing* at any of these
-levels -- both produce byte-identical output at every level tested (5, 6, 7),
-exactly as expected for a construction where the suffix order is
-mathematically unique (see `src/bwt.rs`'s module doc). FPAQ's own hot-path
-probability update was also checked line-by-line against `FPAQCodec.go` and
-matches (same `PSCALE`, same `pr -= pr>>6` / `pr -= (pr-PSCALE+64)>>6`
-update, same per-byte context indexing) -- so the gap isn't an obvious
-single-line bug in the pieces most likely to hide one. Every round trip in
-this repo's history, including this corpus at every level, still decodes
-byte-exact; this is a compression-ratio shortfall, not a correctness bug.
+Earlier revisions of this section reported a real, reproducible gap growing
+from +1.5% (level 6) to +2.8% (levels 8-9), worse on text-heavy files
+(webster, a dictionary, was the worst outlier at +10.24% on its own) and
+invisible on binary ones. That pointed hard at the adaptive entropy coders
+(FPAQ/CM/TPAQ/TPAQX, the stages unique to those levels) rather than the
+transforms feeding them, and cost a long investigation: a full line-by-line
+audit of `TPAQPredictor.go` against `tpaq.rs` (every static table diffed
+programmatically byte-for-byte, `LogisticApm`, the shared arithmetic coder,
+both context branches of `update()`), a cross-check against kanzi-cpp's
+independent C++ implementation, and disproving an initial (wrong) guess
+that suffix-array choice was involved -- swapping the SA-IS backend for
+the `fast-sa` feature's libsais changes nothing at any level, exactly as
+expected for a mathematically unique suffix order. That audit did turn up
+one real, confirmed bug (`TpaqMixer::get()`'s dot product used `i64`
+instead of Go's wrapping `int32` -- fixed, see git log) but fixing it
+changed nothing on this corpus, because it wasn't the cause.
 
-**Per-file breakdown at level 9** (each of the 12 Silesia files compressed
-on its own, not as one concatenated tar) shows the gap tracks content type,
-not file size:
+The actual cause: this crate's Python bindings (`lib.rs`) hardcoded a 4 MiB
+block size for every level. kanzi-go's `BlockCompressor` doesn't -- it
+scales the default block size with level (`app/BlockCompressor.go`):
+levels 0-5 use 4 MiB, level 6 uses 8 MiB, levels 7-8 use 16 MiB, and level 9
+uses 32 MiB, specifically so the adaptive models get more data per block
+before their next reset. Every benchmark and comparison run through this
+repo's Python API had been comparing this port at a *forced* 4 MiB against
+the reference at its *real, level-scaled* default -- smaller blocks meaning
+more frequent model resets, smaller internal hash/dictionary tables, and
+measurably worse compression, entirely unrelated to any algorithmic
+difference. Confirmed by isolating a 1 MiB prefix of webster: dumping the
+post-transform, pre-entropy bytes from both implementations showed they
+were *already* different at 4 MiB (850,884 vs 851,572 bytes) -- and
+re-running this port with `block_size=16_777_216` (level 8's real default)
+instead of the hardcoded 4 MiB made that difference disappear completely,
+byte for byte.
 
-| File | Gap | Content |
-|---|---|---|
-| webster | **+10.24%** | English dictionary (pure text) |
-| samba | +5.88% | C source tarball (mostly text) |
-| nci | +5.10% | chemical structure database |
-| dickens | +4.81% | novel (pure text) |
-| osdb | +4.26% | database sample |
-| mozilla | +4.11% | source tarball (mostly text) |
-| reymont | +2.58% | PDF novel |
-| ooffice | +2.49% | office document |
-| mr | +1.56% | MRI scan (binary) |
-| xml | +1.36% | markup (structured text) |
-| x-ray | +0.83% | X-ray image (binary) |
-| sao | +0.46% | star catalog (binary records) |
-
-Text-heavy files lose noticeably more than binary ones, with webster (a
-dictionary -- about as repetitive and word-structured as English text
-gets) the clear outlier. Isolating webster's *transform* pipeline from its
-*entropy coder* confirms the gap is 100% in entropy coding: webster alone
-through level 5 (TEXT+UTF+BWT+RANK+ANS0, no TPAQX) matches the reference to
-4 bytes out of 8,051,178 (0.00005%) -- so TEXT/UTF/BWT/RANK are exact on
-this exact content, and only TPAQX's adaptive modeling of it diverges.
-
-This pointed the remaining search specifically at TPAQPredictor.go and
-turned up one real, confirmed bug: `TPAQMixer.get()`'s dot product
-(`w0*p0 + w1*p1 + ... + sk`) is int32 arithmetic in Go, with silent
-wraparound on overflow (mixer weights are unbounded by the update rule,
-so this can and eventually does overflow int32 given enough adaptation).
-This port's `TpaqMixer::get()` computed it in `i64` instead -- exactly
-contradicting the file's own fidelity comment, which already claimed
-wrapping i32 for this. Fixed (see git log), and every other part of the
-predictor was checked against `TPAQPredictor.go` line-by-line in the same
-pass: both context branches of `update()`, `findMatch()`, the SSE/mixing
-tail, `LogisticApm` (`AdaptiveProbMap.go`), the shared arithmetic coder
-(`BinaryEntropyCodec.go`), and all four static tables (`STATE_TRANSITIONS`
-x2, `STATE_MAP`, `MATCH_PRED` -- diffed programmatically, byte-for-byte
-identical, not just eyeballed) -- all match. The bitstream version is also
-identical on both sides (kanzi-go's own default is 7, same as this port's
-hardcoded assumption), ruling out a logical-vs-arithmetic-shift mismatch
-on the masked contexts.
-
-The mixer fix, once applied, changed nothing on this corpus (4 MiB blocks
-apparently don't give weights enough room to reach overflow range) -- so
-it's a real fidelity fix, confirmed via the file's own stated intent, but
-not *the* explanation for this gap. With every other line checked and
-matching, whatever's left is likely a much smaller, compounding
-discrepancy invisible to static reading -- the next step would be
-instrumenting both a Go build and this port to dump per-bit predictions
-on the same small input and diffing where they first disagree, which
-wasn't attempted in this pass.
-Not yet root-caused; tracked as a known limitation.
-
-*(An earlier version of this section wrongly attributed part of this gap to
-suffix-array quality, based on a stale-binary comparison between two
-`cargo build` invocations with different `--features` -- corrected after
-rebuilding both configurations back to back and confirming identical output.)*
+Fixed in `lib.rs`: `compress()` now defaults to the same per-level block
+size kanzi-go uses, with an optional `block_size` keyword argument to
+override it (matching the CLI's `-b`/`--block`) for anyone who wants a
+specific block size regardless of level.
 
 ### A note on hardware stability at this scale
 
