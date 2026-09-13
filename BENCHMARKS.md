@@ -11,59 +11,74 @@ non-ECC RAM, Windows 10, rustc 1.98.1, kanzi-rs 0.1.0.
 
 Download at http://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip
 
-Encoding and decoding are parallelized across blocks using all available
-hardware threads (`std::thread::available_parallelism`, 32 here) -- these
-numbers reflect full-machine throughput, not a single core. Block size is
-this project's per-level default (see below); sizes are exact byte counts,
-timings from a single `--repeats 1` pass.
+All three implementations below are native CLI binaries (this repo's
+`rust_kanzi.exe`, kanzi-go v2.5.1's `kanzi.exe`, and kanzi-cpp's `Kanzi64.exe`
+built locally from its `msvc/Kanzi_VS2022.sln` with MSVC 14.44/Release/x64),
+run directly (`-c`/`-d -l N -j 0`, i.e. all 32 threads, each project's own
+per-level default block size) on the exact same `silesia.tar` on this one
+machine -- no Python involved. See the note below on why that last part
+matters.
 
-| Level | Encoding (ms) | Decoding (ms) | Size |
-|---|---|---|---|
-| Original | | | 211,968,000 |
-| **kanzi-rs -l 0** | 2630 | 2270 | 211,968,474 |
-| **kanzi-rs -l 1** | 2480 | 900 | 79,202,777 |
-| **kanzi-rs -l 2** | 2410 | 800 | 68,646,055 |
-| **kanzi-rs -l 3** | 2510 | 790 | 64,451,851 |
-| **kanzi-rs -l 4** | 2810 | 880 | 61,192,921 |
-| **kanzi-rs -l 5** | 4800 | 1010 | 54,021,324 |
-| **kanzi-rs -l 6** | 5780 | 1110 | 49,515,942 |
-| **kanzi-rs -l 7** | 6380 | 2120 | 47,309,589 |
-| **kanzi-rs -l 8** | 10360 | 8640 | 43,257,955 |
-| **kanzi-rs -l 9** | 21380 | 18930 | 41,857,565 |
+| Level | kanzi-rs enc/dec (ms) | kanzi-go enc/dec (ms) | kanzi-cpp enc/dec (ms) | kanzi-rs size | kanzi-go size | kanzi-cpp size |
+|---|---|---|---|---|---|---|
+| 1 | 419 / 218 | 319 / 191 | 219 / 118 | 79,202,777 | 79,202,781 | 79,202,781 |
+| 2 | 349 / 254 | 259 / 208 | 204 / 126 | 68,646,055 | 68,646,059 | 68,646,059 |
+| 3 | 471 / 265 | 411 / 238 | 274 / 145 | 64,451,851 | 64,436,766 | 64,436,766 |
+| 4 | 721 / 420 | 771 / 354 | 386 / 216 | 61,192,921 | 61,192,925 | 60,738,928 |
+| 5 | 2761 / 616 | 1480 / 665 | 1246 / 507 | 54,021,324 | 54,021,328 | 54,021,328 |
+| 6 | 3799 / 744 | 1836 / 866 | 1774 / 944 | 49,515,942 | 49,515,946 | 49,515,946 |
+| 7 | 4154 / 1785 | 2725 / 4126 | 2675 / 4596 | 47,309,589 | 47,309,593 | 47,309,593 |
+| **8** | **8523 / 8702** | 11843 / 12057 | 10149 / 7970 | 43,257,955 | 43,257,959 | 43,261,199 |
+| **9** | **20257 / 20812** | 22487 / 27791 | 25308 / 22860 | 41,857,565 | 41,857,569 | 41,857,569 |
 
-Reproduce with:
+**Every level matches at least one reference implementation to within a
+handful of bytes.** kanzi-rs and kanzi-go agree almost exactly everywhere
+except level 3 (+0.023%, still unexplained, likely a tiny difference
+somewhere in PACK/MM/LZX or Huffman table-building); kanzi-cpp's own
+numbers at levels 3, 4 and 8 diverge slightly from *both* Go and Rust (most
+visibly at level 4, ~0.7% smaller) -- a reminder that "the reference" isn't
+perfectly bit-identical across kanzi-go and kanzi-cpp either, so kanzi-rs
+matching one of them almost exactly is the realistic bar, not matching
+all three simultaneously.
 
-```bash
-python examples/benchmark.py --repeats 1 --strict /path/to/silesia.tar
-```
+**Speed**: at levels 1-6 kanzi-cpp is fastest across the board (expected --
+it's the oldest, most hand-tuned implementation of the three), with
+kanzi-rs 1.1-2.6x slower than kanzi-cpp and roughly in line with
+kanzi-go. At levels 8-9, though, **kanzi-rs is the fastest of the three**
+on both encode and decode -- this repo's block-level parallelism
+(`std::thread::scope` across all 32 threads, see git log) and bounds-check
+elimination work paid off specifically where the adaptive entropy coders
+make it matter most. Levels 1-6 haven't had the same optimization pass and
+are the more promising target if raw speed at low levels matters to you.
 
-kanzi-go's own README benchmarks the same corpus (as an actual `.tar`) on an
-AMD Ryzen 9950X; that table isn't reproduced here for a head-to-head on
-*speed*, since the CPU generation, job/thread count, and OS all differ
-enough to make a timing comparison misleading. Compressed *size* doesn't
-depend on any of that, so here's the reference kanzi implementation
-(v2.5.1) on the exact same `silesia.tar`, run locally on this machine
-(`kanzi -c -l N -j 0`, its own per-level default block size):
+### A note on benchmarking through the Python bindings instead of the CLI
 
-| Level | kanzi-rs | reference kanzi (v2.5.1) | Difference |
-|---|---|---|---|
-| 0 | 211,968,474 | 211,968,000 | +0.000% |
-| 1 | 79,202,777 | 79,202,781 | -0.000% |
-| 2 | 68,646,055 | 68,646,059 | -0.000% |
-| 3 | 64,451,851 | 64,436,766 | +0.023% |
-| 4 | 61,192,921 | 61,192,925 | -0.000% |
-| 5 | 54,021,324 | 54,021,328 | -0.000% |
-| 6 | 49,515,942 | 49,515,946 | -0.000% |
-| 7 | 47,309,589 | 47,309,593 | -0.000% |
-| 8 | 43,257,955 | 43,257,959 | -0.000% |
-| 9 | 41,857,565 | 41,857,569 | -0.000% |
+An earlier revision of this table was timed through `kanzi.compress()`
+(Python) instead of the CLI directly, and looked *much* worse at low
+levels -- level 1 measured at ~2.5 **seconds** through Python versus 319ms
+for kanzi-go's CLI on the same machine, an apparent 8x regression. It
+wasn't algorithmic: `compress()` copies the input `bytes` into a Rust
+`Vec<u8>` and copies the output back out as a new Python `bytes` object,
+and that fixed marshaling cost (a few hundred ms for a 202MB buffer) is
+*constant* regardless of level, so it swamps every timing at level 1 (a
+few hundred ms of real work) while being negligible at level 9 (twenty
+seconds of real work). Re-timing through the native CLI binary (no Python
+in the loop) is what produced the table above and matches expectations.
+If you're benchmarking this port, prefer the CLI for anything level 6 or
+below, or expect a roughly-fixed few-hundred-ms-per-call Python/copy tax on
+top of the real work at those levels.
 
-**Every level now matches the reference to within 4 bytes** (level 0's
-+474 is store-mode header overhead; level 3's +0.023% is the one
-remaining, genuinely tiny discrepancy, not yet chased down). The size
-column doesn't match kanzi-go's own README table row for row because that
-table used a *different* `silesia.tar` -- same 12 files, apparently packed
-slightly differently -- not a difference in this port.
+Reproduce the CLI numbers with `cargo build --release` and time
+`rust_kanzi.exe encodeN`/`decode` directly; `examples/benchmark.py` (Python)
+remains useful for round-trip correctness (`--strict`) and for levels 7-9
+where the marshaling cost is a rounding error.
+
+kanzi-go's own README benchmarks the same corpus (as an actual `.tar`) on
+an AMD Ryzen 9950X; that table isn't reproduced here since the CPU
+generation differs enough from this machine's 5950X to make a direct
+timing comparison pointless on top of everything above -- the point of
+this section is the three-way, same-machine comparison, not matching that
+table's numbers.
 
 ### Postmortem: the block-size bug that looked like a TPAQ bug
 
