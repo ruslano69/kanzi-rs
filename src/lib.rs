@@ -6,6 +6,16 @@ mod bwt;
 mod cm;
 mod container;
 mod datatype;
+// Used by bwt.rs's build_suffix_array only when the `fast-sa` feature is
+// off (the default build uses libsais instead, see bwt.rs) -- allow
+// dead_code outside tests so the default build stays warning-free without
+// gating every item in the module behind the feature flag individually.
+// `compute_bwt` specifically is also never called in *either* build (this
+// crate's bwt.rs builds BWT bytes itself from the plain suffix array
+// rather than DivSufSort's fused constructBWT); it stays public and
+// tested as a faithful, usable port of the original API surface.
+#[cfg_attr(not(test), allow(dead_code))]
+mod divsufsort;
 mod exe;
 mod fpaq;
 mod fsd;
@@ -17,6 +27,10 @@ mod lzx;
 mod magic;
 mod rlt;
 mod rolz;
+// Kept only as an independent correctness oracle for divsufsort.rs's tests
+// (see divsufsort.rs's module doc and test module) -- bwt.rs no longer
+// calls this in a non-test build, hence the blanket allow below.
+#[cfg_attr(not(test), allow(dead_code))]
 mod sais;
 mod sbrt;
 mod srt;

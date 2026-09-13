@@ -1,18 +1,23 @@
 // Port of kanzi-go's BWT stage for level 5: BWTBlockCodec framing
 // (transform/BWTBlockCodec.go) over the BWT core (transform/BWT.go).
 //
-// Forward suffix-array construction purposefully does NOT port DivSufSort
-// (transform/DivSufSort.go, ~2700 lines of Go/Java-specific induced-sorting
-// bookkeeping): the BWT output and primary indexes derive deterministically
-// from the plain suffix array (which is unique -- all n suffixes are
-// pairwise distinct strings), so any correct SA construction yields
-// byte-identical results. This port builds the SA with SA-IS instead (see
-// sais.rs) -- a different, from-scratch, well-documented induced-sorting
-// algorithm in the same near-linear complexity class as DivSufSort, chosen
-// over a literal port for much lower risk of mistranslating DivSufSort's
-// specific micro-optimizations. (An earlier version of this port used
+// Forward suffix-array construction: the BWT output and primary indexes
+// derive deterministically from the plain suffix array (which is unique --
+// all n suffixes are pairwise distinct strings), so any correct SA
+// construction yields byte-identical results. This module picks among
+// three interchangeable backends -- see `build_suffix_array` below --
+// rather than hand-rolling one itself.
+//
+// (History: this port originally built the SA with sais.rs, a from-scratch
+// SA-IS implementation, specifically to avoid the mistranslation risk of a
+// literal DivSufSort port; divsufsort.rs is that DivSufSort port anyway,
+// written later once sais.rs's -- and libsais' -- proven-identical output
+// gave it a cheap correctness oracle to fuzz against. It is faster than
+// sais.rs and needs no C toolchain, so it replaced sais.rs as the default
+// here; sais.rs stays in the tree purely as that test oracle, see
+// divsufsort.rs's own test module. An earlier version before either used
 // prefix-doubling + 2-pass radix sort, O(n log n) and noticeably slower on
-// large blocks; SA-IS replaced it for that reason.)
+// large blocks.)
 //
 // Inverse ports inverseMergeTPSI exactly (single- and 8-chunk walks,
 // sequential -- jobs=1 like this project's single-job container). Go
@@ -43,11 +48,14 @@ use crate::logtables::TAB_LOG2;
 
 /// Suffix-array construction backend for the forward BWT.
 ///
-/// Default: the in-tree SA-IS (`sais.rs`). With the `fast-sa` feature, the
-/// libsais C library is used instead -- it documents the exact same
-/// sentinel convention the BWT stage needs ("sorts suffixes as if a unique,
+/// Default: the in-tree `divsufsort.rs` (a port of kanzi-cpp's DivSufSort) --
+/// pure Rust, no C toolchain needed, and 1.5-2.7x faster than the older
+/// sais.rs backend across the whole Silesia corpus (see BENCHMARKS.md).
+/// With the `fast-sa` feature, the libsais C library is used instead for a
+/// further ~2x on top of that. Both document the exact same sentinel
+/// convention the BWT stage needs ("sorts suffixes as if a unique,
 /// lexicographically smallest character were present at the end of the
-/// text"), so it is a drop-in replacement that yields the identical SA.
+/// text"), so either is a drop-in replacement yielding the identical SA.
 #[cfg(feature = "fast-sa")]
 fn build_suffix_array(src: &[u8]) -> Vec<u32> {
     use libsais::SuffixArrayConstruction;
@@ -68,7 +76,7 @@ fn build_suffix_array(src: &[u8]) -> Vec<u32> {
 
 #[cfg(not(feature = "fast-sa"))]
 fn build_suffix_array(src: &[u8]) -> Vec<u32> {
-    crate::sais::suffix_array(src)
+    crate::divsufsort::suffix_array(src)
 }
 
 pub const BWT_MAX_HEADER_SIZE: usize = 1 + 8 * 4;

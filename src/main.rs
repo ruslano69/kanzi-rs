@@ -6,6 +6,8 @@ mod bwt;
 mod cm;
 mod container;
 mod datatype;
+#[cfg_attr(not(test), allow(dead_code))]
+mod divsufsort;
 mod exe;
 mod fpaq;
 mod fsd;
@@ -17,6 +19,7 @@ mod lzx;
 mod magic;
 mod rlt;
 mod rolz;
+#[cfg_attr(not(test), allow(dead_code))]
 mod sais;
 mod sbrt;
 mod srt;
