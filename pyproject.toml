@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "kanzi-rs"
+description = "Rust port of kanzi-go (lossless data compressor), exposed as a Python extension module"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: System :: Archiving :: Compression",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/ruslano69/kanzi-rs"
+Repository = "https://github.com/ruslano69/kanzi-rs"
+Issues = "https://github.com/ruslano69/kanzi-rs/issues"
+
+[tool.maturin]
+# Cargo.toml's [lib] name already sets the compiled module name to `kanzi`;
+# spelled out here too since it's what `import kanzi` actually loads.
+module-name = "kanzi"

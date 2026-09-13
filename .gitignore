@@ -1,4 +1,5 @@
 /target
 /verify
+/dist
 build.log
 build.txt

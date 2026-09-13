@@ -61,7 +61,14 @@ Requires [maturin](https://www.maturin.rs/) (`pip install maturin`):
 
 ```bash
 maturin build --release
-pip install target/wheels/rust_kanzi-*.whl
+pip install target/wheels/kanzi_rs-*.whl
+```
+
+Or, for local development (builds in place, reinstalls on every `maturin develop`):
+
+```bash
+pip install maturin
+maturin develop --release
 ```
 
 ```python
