@@ -194,13 +194,24 @@ impl TpaqMixer {
 
     fn get(&mut self, p: [i32; 8]) -> i32 {
         self.p = p;
-        let mut dot: i64 = self.skew as i64;
+
+        // Go computes this whole dot product in int32 (each `*` and `+` on
+        // Go's defined-wraparound int32), then shifts and widens to `int`
+        // only at the very end -- NOT widened to 64 bits first. Wrapping
+        // add is commutative/associative mod 2^32 regardless of order, so
+        // accumulating skew+products in any order still matches Go's
+        // left-to-right int32 sum bit-for-bit, including when weights have
+        // drifted far enough for w[i]*p[i] (or the running sum) to
+        // overflow i32 -- which does happen over a long enough block, and
+        // silently diverging from Go's wraparound there was compounding
+        // into a measurable compression-ratio gap on TPAQ/TPAQX.
+        let mut dot: i32 = self.skew;
 
         for i in 0..8 {
-            dot += self.w[i] as i64 * p[i] as i64;
+            dot = dot.wrapping_add(self.w[i].wrapping_mul(p[i]));
         }
 
-        let d = ((dot + 65536) >> 17) as i32;
+        let d = dot.wrapping_add(65536) >> 17;
         let pr = squash_raw(d, &tables().squash);
         self.pr = pr;
         pr
