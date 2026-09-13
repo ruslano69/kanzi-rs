@@ -181,6 +181,49 @@ RANK/SRT/entropy remain untouched and, on this data, comparably or more
 expensive. Profiling and optimizing those is the next place to look for
 closing the full-pipeline gap, not further suffix-array work.
 
+### SRT: applying the same bounds-check-elimination pass, honestly
+
+`sbrt.rs` (RANK, level 5) already went through a bounds-check-elimination
+pass in an earlier commit (`332f7ff`); `srt.rs` (SRT, level 6) never had.
+Following the same recipe that worked for `divsufsort.rs` -- converting
+the checked `[]` indexing in `forward()`'s two per-byte loops (the
+first-symbol/frequency scan, and the main rank-bucket-and-shift loop) to
+`get_unchecked`/`get_unchecked_mut`, with every index provably a byte
+value (<256), a rank slot (<256), or bounded by `count`/`dst.len()`
+(checked once up front) -- and re-verifying the full test suite
+(round-trips included) before and after:
+
+**The result is a real but much smaller win than divsufsort.rs's: ~4%**
+(measured with `srt.forward()` driven directly by real BWT output from
+`webster`, isolated from the rest of the pipeline, before/after with the
+same harness: 215.7ms -> 206.5ms). This is worth keeping (it's free,
+verified-safe speed with zero output-size change), but it does not come
+close to explaining SRT's 17-29% share of block time the way bounds
+checks explained roughly a third of divsufsort.rs's gap to native C++.
+
+The likely reason: `ss_char`/`tr_char` in divsufsort.rs sit in a genuinely
+memory-bound, cache-unfriendly access pattern (`_sa[pa + _sa[x]]`-style
+double indirection through gigantic scratch arrays), where a bounds
+check is pure added latency on top of an already-slow load. SRT's hot
+loop, by contrast, is a tight *serial dependency chain* over 256-entry
+arrays that mostly stay cache-resident: reading `s2r[c]`/`buckets[c]`,
+writing one output byte, then shifting up to `r` entries of a 256-slot
+rank list where each step's input (`r2s[r-1]`) is only known after the
+previous step's output -- a true chain of individually cheap operations
+that a CPU cannot reorder or pipeline around no matter how the bounds
+checks are removed, since the checks were never the dominant cost to
+begin with. (`sbrt.rs`, which does the same style of rank-list
+maintenance and was *already* unchecked before this session even
+started, is the same story -- its 18-32% share is presumably close to
+this same floor already.) Meaningfully beating this would need a
+different data structure or algorithm for the rank-list update itself,
+not further micro-optimization of the current one -- a larger, riskier
+change than anything else done this session, since it risks diverging
+from kanzi-go's exact SRT/RANK output ordering if not done with the same
+care as everything above it. Not attempted here; flagging it as the
+honest ceiling of the low-risk approach instead of overclaiming a bigger
+win than the data supports.
+
 ## silesia.tar
 
 Test machine: AMD Ryzen 9 5950X (16C/32T), all-core fixed at 4000 MHz, 4x DIMM

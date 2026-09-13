@@ -80,26 +80,33 @@ impl Srt {
         let mut r2s = [0u8; 256];
         let mut freqs = [0i32; 256];
 
-        // find first symbols and count occurrences
+        // find first symbols and count occurrences. Bounds-check-eliminated
+        // like sbrt.rs's forward(): `c` is a byte value (<256), `b` counts
+        // distinct byte values seen so far (<=256), and `i`/`j` are kept
+        // strictly < count by both while-conditions below, so every access
+        // is provably in range.
         let mut b = 0usize;
         let mut i = 0usize;
 
         while i < count {
-            let c = src[i] as usize;
+            let ci = unsafe { *src.get_unchecked(i) };
+            let c = ci as usize;
 
-            if freqs[c] == 0 {
-                r2s[b] = src[i];
-                s2r[c] = b as u8;
+            if unsafe { *freqs.get_unchecked(c) } == 0 {
+                unsafe {
+                    *r2s.get_unchecked_mut(b) = ci;
+                    *s2r.get_unchecked_mut(c) = b as u8;
+                }
                 b += 1;
             }
 
             let mut j = i + 1;
 
-            while j < count && src[j] == src[i] {
+            while j < count && unsafe { *src.get_unchecked(j) } == ci {
                 j += 1;
             }
 
-            freqs[c] += (j - i) as i32;
+            unsafe { *freqs.get_unchecked_mut(c) += (j - i) as i32 };
             i = j;
         }
 
@@ -117,21 +124,31 @@ impl Srt {
 
         let header_size = Self::encode_header(&freqs, dst);
 
-        // encoding (dst indices below are header-relative; Go resliced dst)
+        // encoding (dst indices below are header-relative; Go resliced dst).
+        // Bounds-check-eliminated like sbrt.rs's forward(): `c`/`t` are byte
+        // values (<256), `r` is a rank slot (<256, and only decremented
+        // while >0 below), and `i`/`p` stay within `count`/`dst.len()`
+        // (checked via `dst.len() < max_encoded_len(count)` above, which
+        // covers every byte of `src` plus the header) -- this is the same
+        // tight serial dependency chain as SBRT's rank-list maintenance,
+        // just against a bucketed/frequency-sorted rank list instead of a
+        // move-to-front one.
         let mut i = 0usize;
 
         while i < count {
-            let c = src[i];
-            let mut r = s2r[c as usize] as usize;
-            let mut p = buckets[c as usize];
-            dst[header_size + p] = r as u8;
+            let c = unsafe { *src.get_unchecked(i) };
+            let mut r = unsafe { *s2r.get_unchecked(c as usize) } as usize;
+            let mut p = unsafe { *buckets.get_unchecked(c as usize) };
+            unsafe { *dst.get_unchecked_mut(header_size + p) = r as u8 };
             p += 1;
 
             if r > 0 {
                 loop {
-                    let t = r2s[r - 1];
-                    r2s[r] = t;
-                    s2r[t as usize] = r as u8;
+                    let t = unsafe { *r2s.get_unchecked(r - 1) };
+                    unsafe {
+                        *r2s.get_unchecked_mut(r) = t;
+                        *s2r.get_unchecked_mut(t as usize) = r as u8;
+                    }
 
                     if r == 1 {
                         break;
@@ -140,8 +157,10 @@ impl Srt {
                     r -= 1;
                 }
 
-                r2s[0] = c;
-                s2r[c as usize] = 0;
+                unsafe {
+                    *r2s.get_unchecked_mut(0) = c;
+                    *s2r.get_unchecked_mut(c as usize) = 0;
+                }
             }
 
             i += 1;
@@ -159,13 +178,13 @@ impl Srt {
                 }
             }
 
-            while i < count && src[i] == c {
-                dst[header_size + p] = 0;
+            while i < count && unsafe { *src.get_unchecked(i) } == c {
+                unsafe { *dst.get_unchecked_mut(header_size + p) = 0 };
                 p += 1;
                 i += 1;
             }
 
-            buckets[c as usize] = p;
+            unsafe { *buckets.get_unchecked_mut(c as usize) = p };
         }
 
         Ok((count, count + header_size))
