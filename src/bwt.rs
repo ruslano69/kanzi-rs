@@ -41,6 +41,36 @@
 
 use crate::logtables::TAB_LOG2;
 
+/// Suffix-array construction backend for the forward BWT.
+///
+/// Default: the in-tree SA-IS (`sais.rs`). With the `fast-sa` feature, the
+/// libsais C library is used instead -- it documents the exact same
+/// sentinel convention the BWT stage needs ("sorts suffixes as if a unique,
+/// lexicographically smallest character were present at the end of the
+/// text"), so it is a drop-in replacement that yields the identical SA.
+#[cfg(feature = "fast-sa")]
+fn build_suffix_array(src: &[u8]) -> Vec<u32> {
+    use libsais::SuffixArrayConstruction;
+
+    // Single-threaded: the container already encodes blocks concurrently,
+    // so adding libsais' own parallelism per block only oversubscribes the
+    // machine. It also keeps the build free of the OpenMP runtime (the
+    // dependency is declared with `default-features = false`).
+    let sa: Vec<i32> = SuffixArrayConstruction::for_text(src)
+        .in_owned_buffer()
+        .single_threaded()
+        .run()
+        .expect("libsais suffix array construction failed")
+        .into_vec();
+
+    sa.into_iter().map(|x| x as u32).collect()
+}
+
+#[cfg(not(feature = "fast-sa"))]
+fn build_suffix_array(src: &[u8]) -> Vec<u32> {
+    crate::sais::suffix_array(src)
+}
+
 pub const BWT_MAX_HEADER_SIZE: usize = 1 + 8 * 4;
 const BWT_BLOCK_SIZE_THRESHOLD1: usize = 256;
 // True correctness bound of inverseMergeTPSI's (index<<8)|value packing
@@ -78,33 +108,14 @@ fn log2_no_check(x: u32) -> u32 {
 pub struct Bwt {
     buffer: Vec<i32>,
     primary_indexes: [usize; 8],
-    // Suffix-array result, reused across calls (sais.rs allocates its own
-    // scratch internally, per call).
+    // Suffix-array result (owned across calls so its allocation is reused
+    // by the next block handled by the same worker).
     sa: Vec<u32>,
 }
 
 impl Bwt {
     pub fn new() -> Self {
         Bwt { buffer: Vec::new(), primary_indexes: [0usize; 8], sa: Vec::new() }
-    }
-
-    /// Builds the suffix array of `src` via SA-IS (see sais.rs). Standard
-    /// $-sentinel semantics (a shorter suffix sorts first on shared
-    /// prefixes) -- any correct suffix array construction yields the same
-    /// result here (see the module doc comment), so this need not match
-    /// DivSufSort's specific algorithm, just its output.
-    fn build_sa(&mut self, src: &[u8]) -> &[u32] {
-        let n = src.len();
-        debug_assert!(n >= 2);
-
-        let sa = crate::sais::suffix_array(src);
-
-        if self.sa.len() < n {
-            self.sa = vec![0u32; n];
-        }
-
-        self.sa[..n].copy_from_slice(&sa);
-        &self.sa[..n]
     }
 
     /// BWTBlockCodec.Forward: header + BWT data.
@@ -142,15 +153,35 @@ impl Bwt {
         // BWT of the whole block (single SA), chunked only for indexing.
         let step = count.div_ceil(chunks);
 
-        // Inverse-indexed SA ranks: rank[pos] for every position.
-        let sa = self.build_sa(src).to_vec();
-        let mut inv = vec![0u32; count];
+        // Suffix array of `src` via SA-IS (see sais.rs). Owned directly by
+        // `self.sa` so it is freed/reused here instead of copied around:
+        // any correct SA construction yields the same BWT (see module doc).
+        self.sa = build_suffix_array(src);
+        let sa = &self.sa[..count];
+
+        // One pass over the SA locates the primary row (suffix 0) and the
+        // rank of each chunk-start suffix. This replaces a separate
+        // inverse-rank array of n u32 (a full allocation, a random-write
+        // scatter and a random-read gather per block) -- the same fusion
+        // kanzi-cpp's DivSufSort::constructBWT does. The per-element
+        // division is hidden behind the streaming SA reads (see
+        // OPTIMIZATIONS.md, "constructBWT ... Lemire fastmod").
+        let mut p_idx = 0usize; // rank of suffix 0 (primary index, 0-based)
+        let mut chunk_ranks = [0u32; 8];
 
         for (r, &s) in sa.iter().enumerate() {
-            inv[s as usize] = r as u32;
-        }
+            let pos = s as usize;
 
-        let p_idx = inv[0] as usize; // rank of suffix 0 (primary index, 0-based)
+            if pos == 0 {
+                p_idx = r;
+            }
+
+            let c = pos / step;
+
+            if c < chunks && c * step == pos {
+                chunk_ranks[c] = r as u32;
+            }
+        }
 
         // BWT payload: [src[n-1]] + predecessors except the primary row.
         let out = &mut dst[header_size..header_size + count];
@@ -162,7 +193,10 @@ impl Bwt {
                 continue;
             }
 
-            out[o] = src[(s as usize + count - 1) % count];
+            // src[(s + count - 1) % count] without the per-element IDIV:
+            // s is in [0, count), so only s == 0 wraps to the last byte.
+            let pred = if s == 0 { count - 1 } else { s as usize - 1 };
+            out[o] = src[pred];
             o += 1;
         }
 
@@ -176,7 +210,7 @@ impl Bwt {
         for c in 0..chunks {
             // Rank of the chunk-start suffix (0-based, like Go's stored
             // PrimaryIndex(i)-1).
-            let r = inv[(c * step).min(count - 1)] as usize;
+            let r = chunk_ranks[c] as usize;
             let mut shift = (p_index_size - 1) << 3;
 
             loop {
@@ -192,7 +226,7 @@ impl Bwt {
         }
 
         for c in 0..chunks {
-            self.primary_indexes[c] = inv[(c * step).min(count - 1)] as usize + 1;
+            self.primary_indexes[c] = chunk_ranks[c] as usize + 1;
         }
 
         Ok((count, header_size + count))

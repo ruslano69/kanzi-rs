@@ -15,11 +15,11 @@ pub struct Sbrt {
 
 impl Sbrt {
     pub fn new_rank() -> Self {
-        Sbrt {
-            mask1: -1,
-            mask2: -1,
-            shift: 1,
-        }
+        // RANK is the only mode this port currently wires up (level 5/6);
+        // MTF/TIMESTAMP mirror Go's NewSBRT(mode) generality (see Factory.go)
+        // but have no caller yet, so route through the real constructor
+        // instead of duplicating its field formulas here.
+        Self::new(SBRT_MODE_RANK).expect("SBRT_MODE_RANK is always a valid mode")
     }
 
     pub fn new(mode: i32) -> Result<Self, &'static str> {
@@ -63,27 +63,43 @@ impl Sbrt {
         let mut p = [0i64; 256];
         let mut q = [0i64; 256];
 
-        for (i, &b) in src.iter().enumerate() {
+        // All indices below are provably < 256 (byte values / rank slots)
+        // or < count (src/dst length checked above), so the bounds checks
+        // are dropped: this is a tight serial dependency chain and the
+        // checks are pure overhead here.
+        for i in 0..count {
+            let b = unsafe { *src.get_unchecked(i) };
             let c = b as usize;
-            let r = s2r[c] as usize;
-            dst[i] = r as u8;
+            let r0 = unsafe { *s2r.get_unchecked(c) } as usize;
+            unsafe { *dst.get_unchecked_mut(i) = r0 as u8 };
             // Go: ((i & m1) + (p[c] & m2)) >> s with wrapping int arithmetic.
-            let qc = (((i as i64) & m1).wrapping_add(p[c] & m2)) >> s;
-            p[c] = i as i64;
-            q[c] = qc;
+            let qc = (((i as i64) & m1).wrapping_add(unsafe { *p.get_unchecked(c) } & m2)) >> s;
+            unsafe {
+                *p.get_unchecked_mut(c) = i as i64;
+                *q.get_unchecked_mut(c) = qc;
+            }
 
             // Move up symbol to correct rank
-            let mut r = r;
+            let mut r = r0;
 
-            while r > 0 && q[r2s[r - 1] as usize] <= qc {
-                let t = r2s[r - 1];
-                r2s[r] = t;
-                s2r[t as usize] = r as u8;
+            while r > 0 {
+                let t = unsafe { *r2s.get_unchecked(r - 1) } as usize;
+
+                if unsafe { *q.get_unchecked(t) } > qc {
+                    break;
+                }
+
+                unsafe {
+                    *r2s.get_unchecked_mut(r) = t as u8;
+                    *s2r.get_unchecked_mut(t) = r as u8;
+                }
                 r -= 1;
             }
 
-            r2s[r] = b;
-            s2r[c] = r as u8;
+            unsafe {
+                *r2s.get_unchecked_mut(r) = b;
+                *s2r.get_unchecked_mut(c) = r as u8;
+            }
         }
 
         Ok((count, count))
@@ -110,24 +126,38 @@ impl Sbrt {
         let mut p = [0i64; 256];
         let mut q = [0i64; 256];
 
-        for (i, &b) in src.iter().enumerate() {
-            let r = b as usize;
-            let c = r2s[r];
-            dst[i] = c;
-            let qc = (((i as i64) & m1).wrapping_add(p[c as usize] & m2)) >> s;
-            p[c as usize] = i as i64;
-            q[c as usize] = qc;
+        for i in 0..count {
+            let b = unsafe { *src.get_unchecked(i) };
+            let r0 = b as usize;
+            let c = unsafe { *r2s.get_unchecked(r0) };
+            unsafe { *dst.get_unchecked_mut(i) = c };
+            let qc =
+                (((i as i64) & m1).wrapping_add(unsafe { *p.get_unchecked(c as usize) } & m2)) >> s;
+            unsafe {
+                *p.get_unchecked_mut(c as usize) = i as i64;
+                *q.get_unchecked_mut(c as usize) = qc;
+            }
 
             // Move up symbol to correct rank. Go writes only r2s here (the
             // s2r side is not maintained on inverse) -- replicated exactly.
-            let mut r = r;
+            let mut r = r0;
 
-            while r > 0 && q[r2s[r - 1] as usize] <= qc {
-                r2s[r] = r2s[r - 1];
+            while r > 0 {
+                let t = unsafe { *r2s.get_unchecked(r - 1) };
+
+                if unsafe { *q.get_unchecked(t as usize) } > qc {
+                    break;
+                }
+
+                unsafe {
+                    *r2s.get_unchecked_mut(r) = t;
+                }
                 r -= 1;
             }
 
-            r2s[r] = c;
+            unsafe {
+                *r2s.get_unchecked_mut(r) = c;
+            }
         }
 
         Ok((count, count))

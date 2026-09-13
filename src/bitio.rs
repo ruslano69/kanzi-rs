@@ -42,18 +42,33 @@ impl BitWriter {
         let mut remaining = count_bits;
         let mut i = 0;
 
+        if remaining == 0 {
+            return;
+        }
+
+        let nbytes = remaining >> 3;
+        self.out.reserve(nbytes + 8);
+
         // Fast path: writer cursor is byte-aligned -> push whole bytes directly.
         if self.nbits == 0 {
-            let nbytes = remaining >> 3;
             self.out.extend_from_slice(&data[..nbytes]);
             i = nbytes;
             remaining -= nbytes * 8;
         } else {
-            while remaining >= 8 {
-                self.write_bits(data[i] as u64, 8);
+            // Unaligned: one byte out per byte in. Doing this through
+            // `write_bits` (8 bits -> 8 inner iterations) was ~8x slower and
+            // dominated container framing, where the block-length prefix is
+            // almost never a multiple of 8 bits.
+            let nb = self.nbits;
+
+            for _ in 0..nbytes {
+                let b = data[i];
+                self.out.push(self.cur | (b >> nb));
+                self.cur = b << (8 - nb);
                 i += 1;
-                remaining -= 8;
             }
+
+            remaining -= nbytes * 8;
         }
 
         if remaining > 0 {
@@ -202,17 +217,23 @@ impl<'a> BitReader<'a> {
             i = nbytes;
             remaining -= nbytes * 8;
         } else {
-            while remaining >= 64 {
-                let word = self.read_bits(64);
-                dst[i..i + 8].copy_from_slice(&word.to_be_bytes());
-                i += 8;
-                remaining -= 64;
-            }
+            // Unaligned: combine each output byte from two adjacent input
+            // bytes. The previous implementation went through `read_bits`
+            // (an internal multi-step loop) per 8 bits, which was far more
+            // work per byte.
+            let bit_off = self.pos & 7;
+            let mut byte_idx = self.pos >> 3;
+
             while remaining >= 8 {
-                dst[i] = self.read_bits(8) as u8;
+                let b0 = self.byte_at(byte_idx);
+                let b1 = self.byte_at(byte_idx + 1);
+                dst[i] = (b0 << bit_off) | (b1 >> (8 - bit_off));
+                byte_idx += 1;
                 i += 1;
                 remaining -= 8;
             }
+
+            self.pos = byte_idx * 8 + bit_off;
         }
 
         if remaining > 0 {
