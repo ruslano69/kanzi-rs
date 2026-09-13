@@ -133,6 +133,54 @@ pipeline, not just the bare suffix array: encoding the same 8MB real file
 at level 6 with `fast-sa` on and off produced byte-for-byte identical
 `.knz` output, and both decoded back to the exact original input.
 
+### If SA construction is this fast, why is the full pipeline still slower than kanzi-cpp?
+
+A fair question raised against the numbers above: `fast-sa` (libsais)
+builds a suffix array *faster than kanzi-cpp's own native DivSufSort*
+(189ms vs 365ms on dickens -- see the table two sections up), yet the
+main 3-way table at the top of this file still shows kanzi-rs behind
+kanzi-cpp on full-pipeline encode time at levels 1-6. If the sort itself
+wins, the remaining loss has to be somewhere else in the pipeline --
+otherwise this whole section would have quietly polished a part that was
+never the real bottleneck.
+
+Re-instrumented `encode_block5`/`6`/`7` and `Bwt::forward` with temporary
+per-stage `Instant` timers (same approach as the level 5-7 profiling
+pass in git history, not checked in) and ran them on two real files of
+different character (dickens, 10MB English prose; webster, 41MB
+dictionary text) at the default `fast-sa` block sizes. Percentages are
+each stage's share of total CPU time summed across worker threads:
+
+| Stage | L5 dickens | L5 webster | L6 dickens | L6 webster | L7 dickens | L7 webster |
+|---|---|---|---|---|---|---|
+| SA construction | 33.7% | 52.5% | 27.9% | 49.3% | 19.6% | 35.8% |
+| BWT (rest) | 4.6% | 5.8% | 4.5% | 5.2% | 3.1% | 4.1% |
+| TEXT | 20.4% | 17.2% | 16.5% | 13.3% | 10.8% | 9.5% |
+| RANK (sbrt.rs) | **32.0%** | 17.7% | -- | -- | -- | -- |
+| SRT | -- | -- | **29.3%** | 16.9% | -- | -- |
+| ZRLT | 3.2% | 2.6% | 2.5% | 2.0% | -- | -- |
+| LZP | -- | -- | -- | -- | 7.5% | 6.4% |
+| entropy (ANS0/FPAQ/CM) | 5.6% | 3.5% | 19.0% | 12.5% | **58.7%** | **43.5%** |
+
+SA construction is the single largest line item in every case, but it is
+not the *only* large one: at level 5, RANK costs almost as much as the
+suffix sort itself; at level 6, SRT costs *more* than the suffix sort;
+at level 7, the CM entropy coder alone is 1.2-3x the suffix sort's share
+and dominates the whole block. None of RANK (`sbrt.rs`), SRT (`srt.rs`),
+FPAQ, or CM have been through anything like the optimization passes BWT
+and suffix-array construction got this session (parallel BWT, bounds-
+check elimination, libsais, divsufsort.rs) -- so on the current evidence,
+**that** is the more likely source of the remaining gap to kanzi-cpp at
+levels 1-6, not suffix-array construction, which this section's own
+numbers show is already competitive or ahead. Put differently: this
+session's DivSufSort work was not spent optimizing a part the sort
+"already had covered" -- 20-53% of a block's CPU time is a real cost
+center by any measure -- but it does mean further gains from squeezing
+suffix-array construction harder are capped at that same 20-53%, while
+RANK/SRT/entropy remain untouched and, on this data, comparably or more
+expensive. Profiling and optimizing those is the next place to look for
+closing the full-pipeline gap, not further suffix-array work.
+
 ## silesia.tar
 
 Test machine: AMD Ryzen 9 5950X (16C/32T), all-core fixed at 4000 MHz, 4x DIMM
