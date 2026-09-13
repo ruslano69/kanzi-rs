@@ -362,3 +362,69 @@ pub fn inverse(src: &[u8], dst: &mut [u8]) -> Result<(usize, usize), &'static st
         Some(e) => Err(e),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::datatype::DataType;
+
+    fn roundtrip(data: &[u8]) {
+        let mut dst = vec![0u8; max_encoded_len(data.len())];
+        let (read, written, _dt) =
+            forward(data, &mut dst, DataType::Undefined).expect("forward should not decline");
+        assert_eq!(read, data.len());
+        dst.truncate(written);
+
+        let mut back = vec![0u8; data.len() + 16];
+        let (_, back_len) = inverse(&dst, &mut back).expect("inverse should not fail");
+        back.truncate(back_len);
+        assert_eq!(back, data, "RLT round-trip mismatch");
+    }
+
+    #[test]
+    fn regression_run_lengths_around_medium_form_threshold() {
+        // emit_run_length()'s wire format switches from a 1-byte to a
+        // 2-byte encoded length once the run (minus RUN_THRESHOLD) reaches
+        // RUN_LEN_ENCODE1 (224), i.e. an actual run length around 227. A
+        // shadowing bug there (`let run = ...` instead of reassigning)
+        // corrupted every run using the 2-byte form; sweep both sides of
+        // the boundary plus well past it (the 3-byte form) so any future
+        // regression at either threshold fails here instead of needing a
+        // 200MB real-world corpus to surface.
+        for run_len in [1usize, 2, 16, 100, 224, 225, 226, 227, 228, 229, 230, 300, 1000, 8200, 100_000] {
+            // escape byte (least-frequent, here just something absent from
+            // the run) + the run itself + a differing tail so the run has
+            // a clear end and MIN_BLOCK_LENGTH is comfortably exceeded.
+            let mut data = vec![0xFFu8; 20];
+            data.extend(vec![0x00u8; run_len]);
+            data.extend(vec![0xFFu8; 20]);
+            roundtrip(&data);
+        }
+    }
+
+    #[test]
+    fn roundtrip_run_at_very_end_of_buffer() {
+        // The trailing-run edge case that originally surfaced the bug: a
+        // long run of identical bytes ending exactly at the buffer's end
+        // (no differing tail byte after it), which forces the run through
+        // the main loop's boundary handling rather than the simple case.
+        let mut data = vec![0xFFu8; 20];
+        data.extend(vec![0x00u8; 230]);
+        roundtrip(&data);
+    }
+
+    #[test]
+    fn declines_input_below_min_block_length() {
+        let data = vec![0u8; MIN_BLOCK_LENGTH - 1];
+        let mut dst = vec![0u8; max_encoded_len(data.len())];
+        assert!(forward(&data, &mut dst, DataType::Undefined).is_err());
+    }
+
+    #[test]
+    fn inverse_rejects_truncated_input() {
+        // escape(0x00) + escape(0x00) claims "literal escape byte" but is
+        // missing the required trailing 0 marker byte -- truncated.
+        let mut dst = vec![0u8; 16];
+        assert!(inverse(&[0x00, 0x00], &mut dst).is_err());
+    }
+}

@@ -354,3 +354,57 @@ impl Srt {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(data: &[u8]) {
+        let srt = Srt::new();
+        let mut dst = vec![0u8; Srt::max_encoded_len(data.len())];
+        let (read, written) = srt.forward(data, &mut dst).expect("forward failed");
+        assert_eq!(read, data.len());
+        dst.truncate(written);
+
+        let mut back = vec![0u8; data.len()];
+        let (_, back_len) = srt.inverse(&dst, &mut back).expect("inverse failed");
+        back.truncate(back_len);
+        assert_eq!(back, data, "SRT round-trip mismatch");
+    }
+
+    #[test]
+    fn roundtrip_repetitive() {
+        roundtrip(b"the quick brown fox jumps over the lazy dog. the quick brown fox.");
+    }
+
+    #[test]
+    fn roundtrip_all_256_symbols() {
+        let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        roundtrip(&data);
+    }
+
+    #[test]
+    fn roundtrip_single_symbol() {
+        roundtrip(&[7u8; 500]);
+    }
+
+    #[test]
+    fn inverse_rejects_truncated_header() {
+        // Port of kanzi-go's Transforms_test.go "SRT truncated header" case:
+        // a single byte >= 128 promises a multi-byte varint that never
+        // arrives.
+        let srt = Srt::new();
+        let mut dst = vec![0u8; 8];
+        assert!(srt.inverse(&[0x80], &mut dst).is_err());
+    }
+
+    #[test]
+    fn inverse_rejects_inconsistent_frequency_table() {
+        // A header whose frequencies don't sum to the payload length.
+        let srt = Srt::new();
+        let mut freqs = [0u8; 256];
+        freqs[0] = 5; // claims 5 bytes of symbol 0, but no payload follows
+        let mut dst = vec![0u8; 8];
+        assert!(srt.inverse(&freqs, &mut dst).is_err());
+    }
+}
+

@@ -75,8 +75,8 @@ def real_datasets(rust_root: pathlib.Path) -> list[tuple[str, bytes]]:
 def benchmark(name: str, data: bytes, repeats: int = REPEATS) -> bool:
     """Runs the benchmark for one dataset; returns True iff every level's
     round trip matched the input."""
-    print(f"\n=== {name}  ({human(len(data))}) ===")
-    header = f"{'level':>5} | {'size':>10} | {'ratio':>6} | {'saved':>7} | {'enc MB/s':>9} | {'dec MB/s':>9}"
+    print(f"\n=== {name}  ({len(data):,} bytes) ===")
+    header = f"{'level':>5} | {'bytes':>12} | {'size':>10} | {'ratio':>6} | {'saved':>7} | {'enc MB/s':>9} | {'dec MB/s':>9}"
     print(header)
     print("-" * len(header))
 
@@ -102,7 +102,7 @@ def benchmark(name: str, data: bytes, repeats: int = REPEATS) -> bool:
         enc_mbs = len(data) / best_enc / mib
         dec_mbs = len(data) / best_dec / mib
         row = (
-            f"{level:>5} | {human(len(compressed)):>10} | {ratio:5.2f}x | "
+            f"{level:>5} | {len(compressed):>12,} | {human(len(compressed)):>10} | {ratio:5.2f}x | "
             f"{saved * 100:6.1f}% | {enc_mbs:9.1f} | {dec_mbs:9.1f}"
         )
         if mismatch:

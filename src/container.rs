@@ -2327,3 +2327,99 @@ fn encode_block(data: &[u8], lzx: &mut LzxCodec, checksum: Option<(u64, u8)>) ->
     // always re-emits such blocks in transformed-copy form (strict < rule).
     maybe_transformed_copy(normal, &payload, skip_flags, 1, checksum)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEVEL_ENCODERS: [fn(&[u8], u32, u64) -> Vec<u8>; 10] = [
+        encode_level0,
+        encode_level1,
+        encode_level2,
+        encode_level3,
+        encode_level4,
+        encode_level5,
+        encode_level6,
+        encode_level7,
+        encode_level8,
+        encode_level9,
+    ];
+
+    /// Encodes+decodes `data` at every level (default 4 MiB block, no
+    /// checksum) and asserts a byte-exact round trip, naming the failing
+    /// level on mismatch.
+    fn assert_roundtrips_all_levels(data: &[u8]) {
+        for (level, encode) in LEVEL_ENCODERS.iter().enumerate() {
+            let encoded = encode(data, 4 * 1024 * 1024, 0);
+            let decoded = decode(&encoded)
+                .unwrap_or_else(|e| panic!("level {level}: decode failed: {e}"));
+            assert_eq!(decoded, data, "level {level}: round-trip mismatch");
+        }
+    }
+
+    #[test]
+    fn roundtrip_empty() {
+        assert_roundtrips_all_levels(&[]);
+    }
+
+    #[test]
+    fn roundtrip_tiny() {
+        assert_roundtrips_all_levels(b"hi");
+    }
+
+    #[test]
+    fn roundtrip_all_same_byte() {
+        assert_roundtrips_all_levels(&vec![0x42u8; 20_000]);
+    }
+
+    #[test]
+    fn roundtrip_pseudo_random() {
+        // A small xorshift64 PRNG so this test needs no external crate.
+        let mut state: u64 = 0x853c_49e6_748f_ea9b;
+        let mut next_byte = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xFF) as u8
+        };
+        let data: Vec<u8> = (0..65_536).map(|_| next_byte()).collect();
+        assert_roundtrips_all_levels(&data);
+    }
+
+    #[test]
+    fn roundtrip_readme() {
+        // This project's own README as a real, non-synthetic text sample.
+        assert_roundtrips_all_levels(include_bytes!("../README.md"));
+    }
+
+    #[test]
+    fn regression_lzx_tail_match_distance_read() {
+        // lzx.rs's LzxCodec::inverse used to unconditionally read 4 bytes
+        // for a match's distance value (src[m_idx..m_idx+4]) and panic
+        // ("range end index N out of range for slice of length N-1") when
+        // the last match in a block left fewer than 4 bytes after m_idx.
+        // Found via examples/benchmark.py on this exact file at level 3.
+        assert_roundtrips_all_levels(include_bytes!("../README.md"));
+    }
+
+    #[test]
+    fn regression_rlt_long_run_crosses_medium_form_threshold() {
+        // rlt.rs's emit_run_length() shadowed (instead of reassigning) its
+        // `run` parameter inside the medium/long-form branches, so a run of
+        // roughly 227+ identical bytes -- the point where the wire format
+        // switches from a 1-byte to a 2-byte encoded length -- wrote the
+        // wrong low byte and corrupted the rest of the block on decode.
+        // This run length was chosen to land past that threshold.
+        let mut data = vec![b'A'; 200];
+        data.extend(std::iter::repeat_n(0u8, 300));
+        data.extend(vec![b'B'; 200]);
+        assert_roundtrips_all_levels(&data);
+    }
+
+    #[test]
+    fn roundtrip_text_like_content() {
+        // Rust source (this project's own) as a second, differently-shaped
+        // real-content sample: lots of ASCII, braces, and identifiers.
+        assert_roundtrips_all_levels(include_bytes!("rlt.rs"));
+    }
+}

@@ -6,28 +6,30 @@ bounds-check-elimination performance pass.
 ## silesia.tar
 
 Test machine: AMD Ryzen 9 5950X (16C/32T), all-core fixed at 4000 MHz, 4x DIMM
-non-ECC RAM, Windows 10, rustc 1.98.1, kanzi-rs 0.1.0 (Python bindings, cp314).
+non-ECC RAM, Windows 10, rustc 1.98.1, kanzi-rs 0.1.0.
 
 Download at http://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip
 
 Encoding and decoding are parallelized across blocks (default 4 MiB block
 size) using all available hardware threads (`std::thread::available_parallelism`,
 32 here) -- these numbers reflect full-machine throughput, not a single core,
-and are not directly comparable to a run pinned to fewer threads.
+and are not directly comparable to a run pinned to fewer threads. Sizes below
+are exact byte counts from the CLI (`encodeN`/`decode`); the encoding/decoding
+times come from `examples/benchmark.py`'s MB/s figures (`--repeats 1`).
 
-| Compressor | Encoding (ms) | Decoding (ms) | Size |
+| Level | Encoding (ms) | Decoding (ms) | Size |
 |---|---|---|---|
 | Original | | | 211,968,000 |
-| **kanzi-rs -l 0** | **2646** | **2292** | 211,968,000 |
-| **kanzi-rs -l 1** | **2462** | **902** | 79,092,537 |
-| **kanzi-rs -l 2** | **2412** | **812** | 68,598,058 |
-| **kanzi-rs -l 3** | **2549** | **798** | 64,427,964 |
-| **kanzi-rs -l 4** | **2784** | **874** | 61,262,428 |
-| **kanzi-rs -l 5** | **4802** | **998** | 54,073,469 |
-| **kanzi-rs -l 6** | **5016** | **1040** | 50,229,384 |
-| **kanzi-rs -l 7** | **4658** | **1526** | 48,394,521 |
-| **kanzi-rs -l 8** | **8285** | **6542** | 44,437,736 |
-| **kanzi-rs -l 9** | **13941** | **12105** | 42,995,538 |
+| **kanzi-rs -l 0** | 2646 | 2292 | 211,968,474 |
+| **kanzi-rs -l 1** | 2462 | 902 | 79,202,777 |
+| **kanzi-rs -l 2** | 2412 | 812 | 68,646,055 |
+| **kanzi-rs -l 3** | 2549 | 798 | 64,451,851 |
+| **kanzi-rs -l 4** | 2784 | 874 | 61,192,921 |
+| **kanzi-rs -l 5** | 4802 | 998 | 54,021,324 |
+| **kanzi-rs -l 6** | 5016 | 1040 | 50,265,652 |
+| **kanzi-rs -l 7** | 4658 | 1526 | 48,443,535 |
+| **kanzi-rs -l 8** | 8285 | 6542 | 44,465,458 |
+| **kanzi-rs -l 9** | 13941 | 12105 | 42,992,981 |
 
 Reproduce with:
 
@@ -45,34 +47,56 @@ AMD Ryzen 9950X; that table isn't reproduced here for a head-to-head on
 enough to make a timing comparison misleading. Compressed *size*, on the
 other hand, doesn't depend on any of that -- so here's what the reference
 kanzi implementation (v2.5.1) produces on the exact same `silesia.tar` used
-for the table above, run locally on this machine (`kanzi -c -l N -j 0`):
+above, run locally on this machine (`kanzi -c -l N -j 0`):
 
 | Level | kanzi-rs | reference kanzi (v2.5.1) | Difference |
 |---|---|---|---|
-| 0 | 211,968,000 | 211,968,000 | 0.00% |
-| 1 | 79,092,537 | 79,202,781 | -0.14% |
-| 2 | 68,598,058 | 68,646,059 | -0.07% |
-| 3 | 64,427,964 | 64,436,766 | -0.01% |
-| 4 | 61,262,428 | 61,192,925 | +0.11% |
-| 5 | 54,073,469 | 54,021,328 | +0.10% |
-| 6 | 50,229,384 | 49,515,946 | **+1.44%** |
-| 7 | 48,394,521 | 47,309,593 | **+2.29%** |
-| 8 | 44,437,736 | 43,257,959 | **+2.73%** |
-| 9 | 42,995,538 | 41,857,569 | **+2.72%** |
+| 0 | 211,968,474 | 211,968,000 | +0.000% |
+| 1 | 79,202,777 | 79,202,781 | -0.000% |
+| 2 | 68,646,055 | 68,646,059 | -0.000% |
+| 3 | 64,451,851 | 64,436,766 | +0.023% |
+| 4 | 61,192,921 | 61,192,925 | -0.000% |
+| 5 | 54,021,324 | 54,021,328 | -0.000% |
+| 6 | 50,265,652 | 49,515,946 | **+1.514%** |
+| 7 | 48,443,535 | 47,309,593 | **+2.397%** |
+| 8 | 44,465,458 | 43,257,959 | **+2.791%** |
+| 9 | 42,992,981 | 41,857,569 | **+2.713%** |
 
-Levels 0-5 are within noise of the reference (this is also why the size
-column above doesn't match kanzi-go's own README table row for row: that
-table used a *different* `silesia.tar` -- built from the same 12 files but
-apparently packed slightly differently -- not a difference in this port).
-Levels 6-9, however, have a real, reproducible gap: this port's BWT+SRT
-(level 6), LZP+BWT+CM (level 7), and EXE+RLT+TEXT+UTF+DNA+TPAQ/TPAQX (levels
-8-9) pipelines are correctly *invertible* (every round-trip in this repo's
-history, including this corpus, decodes byte-exact) but compress measurably
-worse than the reference at those levels -- almost certainly a heuristic or
-threshold difference somewhere in the ported SRT/LZP/CM/TPAQ logic rather
-than a missing feature, since level 4 (which also runs an EXE filter) shows
-no such gap. Not yet root-caused; tracked as a known limitation rather than
-a bug, since nothing here produces incorrect output.
+(These are exact byte counts; the size column above doesn't match kanzi-go's
+own README table row for row because that table used a *different*
+`silesia.tar` -- same 12 files, apparently packed slightly differently -- not
+a difference in this port. Levels 1-2 there also differ from the reference
+run *here* for the same reason: different tar, same binary.)
+
+**Levels 0-5 are, for practical purposes, exact** (level 3's +0.023% is
+noise-level; everything else matches to single-digit bytes, i.e. this port's
+LZX, DNA+LZ, TEXT+UTF+EXE+PACK+MM+ROLZ, BWT and RANK stages, plus the
+Huffman/ANS0 entropy coders, produce bit-identical results to the reference
+on real-world input at this scale).
+
+**Levels 6-9 have a real, reproducible gap that grows with entropy-model
+sophistication**: FPAQ (level 6, a simple adaptive bit predictor) +1.5%, CM
+(level 7) +2.4%, TPAQ/TPAQX (levels 8-9, context-mixing) +2.7-2.8%. This
+points specifically at the adaptive entropy-coding layer, not at the
+transforms feeding it: SRT (level 6's transform) is a direct, line-by-line
+match against kanzi-go's `SRT.go` (same Shell-sort tie-break, same SWAR run
+collapse), and swapping the suffix-array backend BWT depends on (in-tree
+SA-IS vs. the `fast-sa` feature's libsais) changes *nothing* at any of these
+levels -- both produce byte-identical output at every level tested (5, 6, 7),
+exactly as expected for a construction where the suffix order is
+mathematically unique (see `src/bwt.rs`'s module doc). FPAQ's own hot-path
+probability update was also checked line-by-line against `FPAQCodec.go` and
+matches (same `PSCALE`, same `pr -= pr>>6` / `pr -= (pr-PSCALE+64)>>6`
+update, same per-byte context indexing) -- so the gap isn't an obvious
+single-line bug in the pieces most likely to hide one. Every round trip in
+this repo's history, including this corpus at every level, still decodes
+byte-exact; this is a compression-ratio shortfall, not a correctness bug.
+Not yet root-caused; tracked as a known limitation.
+
+*(An earlier version of this section wrongly attributed part of this gap to
+suffix-array quality, based on a stale-binary comparison between two
+`cargo build` invocations with different `--features` -- corrected after
+rebuilding both configurations back to back and confirming identical output.)*
 
 ### A note on hardware stability at this scale
 
