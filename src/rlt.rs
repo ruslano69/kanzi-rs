@@ -27,7 +27,7 @@ pub fn max_encoded_len(src_len: usize) -> usize {
 }
 
 fn emit_run_length(dst: &mut [u8], run: i32) -> usize {
-    let run = run - RUN_THRESHOLD;
+    let mut run = run - RUN_THRESHOLD;
 
     if run < RUN_LEN_ENCODE1 {
         dst[0] = run as u8;
@@ -37,11 +37,11 @@ fn emit_run_length(dst: &mut [u8], run: i32) -> usize {
     let dst_idx;
 
     if run < RUN_LEN_ENCODE2 {
-        let run = run - RUN_LEN_ENCODE1;
+        run -= RUN_LEN_ENCODE1;
         dst[0] = (RUN_LEN_ENCODE1 + (run >> 8)) as u8;
         dst_idx = 1;
     } else {
-        let run = run - RUN_LEN_ENCODE2;
+        run -= RUN_LEN_ENCODE2;
         dst[0] = 0xFF;
         dst[1] = (run >> 8) as u8;
         dst_idx = 2;

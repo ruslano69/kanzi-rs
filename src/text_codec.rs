@@ -119,7 +119,6 @@ pub(crate) fn create_dictionary(
 
     if nb_words < max_words {
         bounds.push((anchor, n, h));
-        nb_words += 1;
     }
 
     let words_ro: &[u8] = words;

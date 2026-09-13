@@ -220,6 +220,10 @@ pub fn forward(
 ) -> Result<(usize, usize, DataType), (&'static str, DataType)> {
     let count = src.len();
 
+    if count < TC1_MIN_BLOCK_SIZE {
+        return Err(("block too small", DataType::Undefined));
+    }
+
     if dst.len() < count {
         return Err(("Output buffer is too small", DataType::Undefined));
     }

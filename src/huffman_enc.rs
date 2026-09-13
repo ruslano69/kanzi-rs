@@ -431,7 +431,6 @@ impl HuffmanEncoder {
 
             if bits > 0 {
                 self.buffer[buf_off + idx] = (state << (8 - bits)) as u8;
-                idx += 1;
             }
         }
 
