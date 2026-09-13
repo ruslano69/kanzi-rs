@@ -1,0 +1,13 @@
+# PyO3's `extension-module` feature deliberately doesn't link against
+# libpython (a Python extension resolves those symbols at dlopen time via
+# the interpreter that loads it). maturin knows to pass macOS's
+# "-undefined dynamic_lookup" for that reason when it builds the wheel, but
+# a plain `cargo build`/`cargo test` on macOS doesn't -- and ld64 (unlike
+# Linux's linker) rejects undefined symbols in a dylib by default, so the
+# link step fails. This is PyO3's documented fix, applied here so `cargo
+# build` works the same way on macOS as it already does via maturin.
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
