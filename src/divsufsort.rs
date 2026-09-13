@@ -346,31 +346,53 @@ impl<'a> Ctx<'a> {
     // `p[sapa[_sa[x]]]` / `arr[isad + arr[x]]` pointer-chasing idioms).
     // -------------------------------------------------------------
 
+    /// EXPERIMENTAL (not yet applied crate-wide): unchecked reads for the
+    /// handful of accessors that sit in this algorithm's hottest loops,
+    /// mirroring sais.rs's own documented "get_unchecked after indices are
+    /// proven in range" approach. Safety: every index passed to `sa_at`
+    /// here is exactly the same expression the original C++ dereferences
+    /// through a raw `int*`/`uint8*` with zero checking of its own -- the
+    /// algorithm's own invariants (not this port's) are what keep it in
+    /// bounds, the same invariants ~10000+ fuzzed/real-file test runs in
+    /// this module's own test suite already exercise without ever tripping
+    /// the safe version's bounds check.
+    #[inline(always)]
+    fn buf_at(&self, i: i32) -> u8 {
+        debug_assert!(i >= 0 && (i as usize) < self.buffer.len());
+        unsafe { *self.buffer.get_unchecked(i as usize) }
+    }
+
+    #[inline(always)]
+    fn sa_at(&self, i: i32) -> i32 {
+        debug_assert!(i >= 0 && (i as usize) < self.sa.len());
+        unsafe { *self.sa.get_unchecked(i as usize) }
+    }
+
     /// `_buffer[idx + _sa[pa + _sa[pos]]]` -- the byte at depth `idx` of
     /// the suffix whose start position is stored at `_sa[pa + _sa[pos]]`.
     #[inline]
     fn ss_char(&self, idx: i32, pa: i32, pos: i32) -> i32 {
-        self.buffer[(idx + self.sa[(pa + self.sa[pos as usize]) as usize]) as usize] as i32
+        self.buf_at(idx + self.sa_at(pa + self.sa_at(pos))) as i32
     }
 
     /// `_buffer[idx + _sa[pa + v]]` -- like `ss_char`, but `v` is already a
     /// suffix start position (not an index that itself needs an `_sa` hop).
     #[inline]
     fn ss_char_val(&self, idx: i32, pa: i32, v: i32) -> i32 {
-        self.buffer[(idx + self.sa[(pa + v) as usize]) as usize] as i32
+        self.buf_at(idx + self.sa_at(pa + v)) as i32
     }
 
     /// `_sa[isad + _sa[pos]]` -- the rank at depth `isad` of the suffix
     /// whose start position is stored at `_sa[pos]`.
     #[inline]
     fn tr_char(&self, isad: i32, pos: i32) -> i32 {
-        self.sa[(isad + self.sa[pos as usize]) as usize]
+        self.sa_at(isad + self.sa_at(pos))
     }
 
     /// `_sa[isad + v]` -- like `tr_char`, but `v` is already a position.
     #[inline]
     fn tr_char_val(&self, isad: i32, v: i32) -> i32 {
-        self.sa[(isad + v) as usize]
+        self.sa_at(isad + v)
     }
 
     // -------------------------------------------------------------
@@ -886,25 +908,25 @@ impl<'a> Ctx<'a> {
     /// here by the index of their first element.
     #[inline]
     fn ss_compare(&self, idx1: i32, idx2: i32, depth: i32) -> i32 {
-        let mut u1 = depth + self.sa[idx1 as usize];
-        let mut u2 = depth + self.sa[idx2 as usize];
-        let u1n = self.sa[(idx1 + 1) as usize] + 2;
-        let u2n = self.sa[(idx2 + 1) as usize] + 2;
+        let mut u1 = depth + self.sa_at(idx1);
+        let mut u2 = depth + self.sa_at(idx2);
+        let u1n = self.sa_at(idx1 + 1) + 2;
+        let u2n = self.sa_at(idx2 + 1) + 2;
 
         if u1n - u1 > u2n - u2 {
-            while u2 < u2n && self.buffer[u1 as usize] == self.buffer[u2 as usize] {
+            while u2 < u2n && self.buf_at(u1) == self.buf_at(u2) {
                 u1 += 1;
                 u2 += 1;
             }
         } else {
-            while u1 < u1n && self.buffer[u1 as usize] == self.buffer[u2 as usize] {
+            while u1 < u1n && self.buf_at(u1) == self.buf_at(u2) {
                 u1 += 1;
                 u2 += 1;
             }
         }
 
         if u1 < u1n {
-            if u2 < u2n { self.buffer[u1 as usize] as i32 - self.buffer[u2 as usize] as i32 } else { 1 }
+            if u2 < u2n { self.buf_at(u1) as i32 - self.buf_at(u2) as i32 } else { 1 }
         } else if u2 < u2n {
             -1
         } else {
@@ -918,24 +940,24 @@ impl<'a> Ctx<'a> {
     #[inline]
     fn ss_compare_val(&self, pa_val: i32, pb_val: i32, p2_idx: i32, depth: i32) -> i32 {
         let mut u1 = depth + pa_val;
-        let mut u2 = depth + self.sa[p2_idx as usize];
+        let mut u2 = depth + self.sa_at(p2_idx);
         let u1n = pb_val + 2;
-        let u2n = self.sa[(p2_idx + 1) as usize] + 2;
+        let u2n = self.sa_at(p2_idx + 1) + 2;
 
         if u1n - u1 > u2n - u2 {
-            while u2 < u2n && self.buffer[u1 as usize] == self.buffer[u2 as usize] {
+            while u2 < u2n && self.buf_at(u1) == self.buf_at(u2) {
                 u1 += 1;
                 u2 += 1;
             }
         } else {
-            while u1 < u1n && self.buffer[u1 as usize] == self.buffer[u2 as usize] {
+            while u1 < u1n && self.buf_at(u1) == self.buf_at(u2) {
                 u1 += 1;
                 u2 += 1;
             }
         }
 
         if u1 < u1n {
-            if u2 < u2n { self.buffer[u1 as usize] as i32 - self.buffer[u2 as usize] as i32 } else { 1 }
+            if u2 < u2n { self.buf_at(u1) as i32 - self.buf_at(u2) as i32 } else { 1 }
         } else if u2 < u2n {
             -1
         } else {

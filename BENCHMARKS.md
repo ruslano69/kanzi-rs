@@ -40,28 +40,93 @@ without a Go or C++ debugger to step through side by side.
 
 | File | divsufsort.rs | sais.rs (old default) | libsais (`fast-sa`) |
 |---|---|---|---|
-| dickens (10MB) | 421ms | 630ms | 189ms |
-| mr (10MB) | 406ms | 521ms | 158ms |
-| ooffice (6MB) | 209ms | 406ms | 119ms |
-| osdb (10MB) | 354ms | 549ms | 201ms |
-| reymont (6MB) | 254ms | 311ms | 116ms |
-| samba (21MB) | 721ms | 1536ms | 402ms |
-| sao (7MB) | 238ms | 457ms | 178ms |
-| nci (34MB) | 1209ms | 1486ms | 545ms |
-| x-ray (8MB) | 349ms | 490ms | 200ms |
+| dickens (10MB) | 409ms | 630ms | 189ms |
+| mr (10MB) | 370ms | 521ms | 158ms |
+| ooffice (6MB) | 192ms | 406ms | 119ms |
+| osdb (10MB) | 347ms | 549ms | 201ms |
+| reymont (6MB) | 238ms | 311ms | 116ms |
+| samba (21MB) | 682ms | 1536ms | 402ms |
+| sao (7MB) | 224ms | 457ms | 178ms |
+| nci (34MB) | 1169ms | 1486ms | 545ms |
+| x-ray (8MB) | 340ms | 490ms | 200ms |
 | xml (5MB) | 146ms | 211ms | 75ms |
-| webster (41MB) | 2152ms | 3196ms | 904ms |
-| mozilla (51MB) | 2109ms | 5627ms | 1103ms |
+| webster (41MB) | 2048ms | 3196ms | 904ms |
+| mozilla (51MB) | 1942ms | 5627ms | 1103ms |
 
-`divsufsort.rs` is **1.4-2.7x faster than `sais.rs`** on every file above
+`divsufsort.rs` is **1.3-2.9x faster than `sais.rs`** on every file above
 while adding zero build-time dependencies (pure Rust, no C compiler
 needed) -- and every one of these 12 runs produced a byte-for-byte
 identical suffix array across all three backends, matching `bwt.rs`'s own
 "any correct SA construction yields the same BWT" argument empirically,
 not just in theory. libsais remains faster still (roughly another 2x),
 which is why `fast-sa` stays the default feature for anyone with a C
-toolchain available; `divsufsort.rs` is now what you get without one,
-in place of the older, slower `sais.rs`.
+toolchain available; `divsufsort.rs` is now what you get without one, in
+place of the older, slower `sais.rs`.
+
+### A closer look: is this "identical" port actually as fast as the C++ it was ported from?
+
+The comparisons above are all against *other Rust code* (sais.rs, and
+libsais through its Rust bindings) -- none of them answer the more basic
+question a mechanical, line-by-line port invites: does it run at the same
+speed as the literal C++ it mirrors? It does not, and the gap and its
+cause are worth stating plainly rather than leaving implicit.
+
+A standalone harness (`sabench.cpp`, MSVC 14.44 `/O2 /std:c++17`, not
+checked into this repo) links kanzi-cpp's actual `DivSufSort.cpp`/`.hpp`
+unmodified and times `computeSuffixArray` alone, with no BWT framing, no
+entropy coding, nothing else -- the closest possible apples-to-apples
+comparison to `divsufsort.rs`'s own `suffix_array`, same machine, same
+files:
+
+| File | native C++ DivSufSort | divsufsort.rs | ratio |
+|---|---|---|---|
+| dickens | 364.9ms | 409ms | 1.12x |
+| mr | 351.7ms | 370ms | 1.05x |
+| ooffice | 176.5ms | 192ms | 1.09x |
+| osdb | 288.4ms | 347ms | 1.20x |
+| reymont | 216.6ms | 238ms | 1.10x |
+| samba | 615.8ms | 682ms | 1.11x |
+| sao | 208.6ms | 224ms | 1.07x |
+| nci | 1011.0ms | 1169ms | 1.16x |
+| x-ray | 307.5ms | 340ms | 1.11x |
+| xml | 129.8ms | 146ms | 1.13x |
+| webster | 1885.2ms | 2048ms | 1.09x |
+| mozilla | 1789.7ms | 1942ms | 1.09x |
+
+**The Rust port is consistently ~5-20% slower than the native C++ it was
+ported from** (aggregate: 8107ms vs 7346ms, 1.10x). An earlier revision of
+this section didn't run this specific comparison and, by only comparing
+against other Rust backends, left room to misread "faster than sais.rs"
+as "as fast as the C++ original" -- it isn't, and there's no reason to
+expect a mechanical translation to be: the algorithm is identical, but
+what the two compilers are allowed to assume about memory access is not.
+
+**Root cause, confirmed rather than assumed:** every one of DivSufSort's
+thousands of `_sa[...]`/`_buffer[...]` dereferences in the C++ is a raw,
+unchecked pointer read. Rust's `Index` on a slice inserts a bounds check
+at (almost) every one of those sites unless the compiler can prove it
+unnecessary, which it generally cannot here -- most indices are computed
+from other array reads (`_sa[pa + _sa[x]]`-style double indirection), not
+from a simple loop counter LLVM's bounds-check-elimination pass can
+reason about. `sais.rs` already documents having deliberately used
+`get_unchecked` in its own hot loops for exactly this reason; this port's
+first version used none at all. Converting the handful of accessors
+actually called in the innermost comparison/pivot/heap loops (`ss_char`,
+`ss_char_val`, `tr_char`, `tr_char_val`, and the character-scan loop
+inside `ss_compare`/`ss_compare_val`) to `get_unchecked` -- guarded by a
+`debug_assert!` so a debug build still catches any violation, safe under
+the exact same invariant the original C++ already relies on with *zero*
+checking of its own, and re-verified against the entire test suite
+(fuzzing included) both before and after -- closed roughly a third of the
+gap on its own (16.6% slower -> 10.4% slower in aggregate). The residual
+~10% almost certainly has the same root cause spread across the rest of
+the module's indexing (every `ss_sort`/`ss_swap_merge`/`tr_intro_sort`
+loop body still uses checked indexing), plus whatever remaining share is
+ordinary MSVC-vs-LLVM codegen variance for this style of code. Applying
+`get_unchecked` module-wide would likely close most of the rest, at the
+cost of auditing every remaining index expression's safety instead of
+just the six hottest ones -- not done here; call it a documented, tested,
+partially-closed gap rather than a mystery.
 
 An end-to-end check confirms the same holds through the full container
 pipeline, not just the bare suffix array: encoding the same 8MB real file
