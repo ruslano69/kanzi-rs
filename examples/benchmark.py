@@ -5,6 +5,7 @@ Usage:
     python examples/benchmark.py                 # use real files from this repo
     python examples/benchmark.py file1 file2...   # benchmark specific files
     python examples/benchmark.py --strict         # exit(1) on any round-trip mismatch
+    python examples/benchmark.py --repeats N file # keep the fastest of N runs (default 3)
 
 With no arguments, benchmarks real, representative content already sitting in
 this repo instead of made-up data:
@@ -71,7 +72,7 @@ def real_datasets(rust_root: pathlib.Path) -> list[tuple[str, bytes]]:
     return datasets
 
 
-def benchmark(name: str, data: bytes) -> bool:
+def benchmark(name: str, data: bytes, repeats: int = REPEATS) -> bool:
     """Runs the benchmark for one dataset; returns True iff every level's
     round trip matched the input."""
     print(f"\n=== {name}  ({human(len(data))}) ===")
@@ -85,7 +86,7 @@ def benchmark(name: str, data: bytes) -> bool:
         best_enc = best_dec = None
         compressed = b""
         mismatch = False
-        for _ in range(REPEATS):
+        for _ in range(repeats):
             t0 = time.perf_counter()
             compressed = kanzi.compress(data, level)
             t1 = time.perf_counter()
@@ -117,6 +118,12 @@ def main() -> None:
     strict = "--strict" in args
     args = [a for a in args if a != "--strict"]
 
+    repeats = REPEATS
+    if "--repeats" in args:
+        i = args.index("--repeats")
+        repeats = int(args[i + 1])
+        args = args[:i] + args[i + 2 :]
+
     if args:
         datasets = [(pathlib.Path(p).name, pathlib.Path(p).read_bytes()) for p in args]
     else:
@@ -125,7 +132,7 @@ def main() -> None:
 
     all_ok = True
     for name, data in datasets:
-        all_ok &= benchmark(name, data)
+        all_ok &= benchmark(name, data, repeats)
 
     if strict and not all_ok:
         print("\n--strict: at least one round-trip mismatch above, failing.", file=sys.stderr)
