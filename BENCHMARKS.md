@@ -261,6 +261,30 @@ much better locality (`ctx` walks a fixed 8-level trie per byte, not an
 arbitrary computed offset) -- there's simply less latency for a bounds
 check to hide behind here than in DivSufSort's double indirection.
 
+### FPAQ: the same pass, with a negative result -- and that's fine
+
+For completeness, the identical treatment was tried on `fpaq.rs`'s
+`FpaqEncoder::write()` (level 6's entropy stage, `probs[ptab][i1]`
+indexing at the same once-per-bit frequency as CM). Measured the same
+way, before/after with the same harness: 675.1ms vs 680.8ms -- no
+measurable difference (within noise, if anything marginally worse).
+**Reverted rather than kept**, since there is no reason to carry `unsafe`
+code that buys nothing.
+
+The likely explanation: `probs` is a small, fixed-size `[[i32; 256]; 4]`
+(not a `Vec`, unlike `cm.rs`'s `counter1`/`counter2`), and both indices
+into it are simple bit-shifts of a `u8` (`ptab = val >> 6`, `i1 = bits >>
+shift` for `bits` itself a small, narrow-range value) -- exactly the kind
+of provably-in-range expression LLVM's own bounds-check-elimination pass
+already handles well, unlike `cm.rs`'s indices (`pc1 + 256`, `pc1 + c1`,
+etc. into a `Vec<i32>`), which involve more arithmetic and a
+heap-allocated backing store LLVM reasons about less aggressively. Net
+effect: this project's earlier, successful bounds-check-elimination
+passes (BWT, SA-IS, SBRT, divsufsort.rs, SRT, CM) all target the same
+underlying overhead, but that overhead is not uniformly present --
+sometimes, as here, the compiler already removed it, and the honest
+result of checking is "no change," not a manufactured win.
+
 ## silesia.tar
 
 Test machine: AMD Ryzen 9 5950X (16C/32T), all-core fixed at 4000 MHz, 4x DIMM
