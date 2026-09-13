@@ -91,6 +91,61 @@ update, same per-byte context indexing) -- so the gap isn't an obvious
 single-line bug in the pieces most likely to hide one. Every round trip in
 this repo's history, including this corpus at every level, still decodes
 byte-exact; this is a compression-ratio shortfall, not a correctness bug.
+
+**Per-file breakdown at level 9** (each of the 12 Silesia files compressed
+on its own, not as one concatenated tar) shows the gap tracks content type,
+not file size:
+
+| File | Gap | Content |
+|---|---|---|
+| webster | **+10.24%** | English dictionary (pure text) |
+| samba | +5.88% | C source tarball (mostly text) |
+| nci | +5.10% | chemical structure database |
+| dickens | +4.81% | novel (pure text) |
+| osdb | +4.26% | database sample |
+| mozilla | +4.11% | source tarball (mostly text) |
+| reymont | +2.58% | PDF novel |
+| ooffice | +2.49% | office document |
+| mr | +1.56% | MRI scan (binary) |
+| xml | +1.36% | markup (structured text) |
+| x-ray | +0.83% | X-ray image (binary) |
+| sao | +0.46% | star catalog (binary records) |
+
+Text-heavy files lose noticeably more than binary ones, with webster (a
+dictionary -- about as repetitive and word-structured as English text
+gets) the clear outlier. Isolating webster's *transform* pipeline from its
+*entropy coder* confirms the gap is 100% in entropy coding: webster alone
+through level 5 (TEXT+UTF+BWT+RANK+ANS0, no TPAQX) matches the reference to
+4 bytes out of 8,051,178 (0.00005%) -- so TEXT/UTF/BWT/RANK are exact on
+this exact content, and only TPAQX's adaptive modeling of it diverges.
+
+This pointed the remaining search specifically at TPAQPredictor.go and
+turned up one real, confirmed bug: `TPAQMixer.get()`'s dot product
+(`w0*p0 + w1*p1 + ... + sk`) is int32 arithmetic in Go, with silent
+wraparound on overflow (mixer weights are unbounded by the update rule,
+so this can and eventually does overflow int32 given enough adaptation).
+This port's `TpaqMixer::get()` computed it in `i64` instead -- exactly
+contradicting the file's own fidelity comment, which already claimed
+wrapping i32 for this. Fixed (see git log), and every other part of the
+predictor was checked against `TPAQPredictor.go` line-by-line in the same
+pass: both context branches of `update()`, `findMatch()`, the SSE/mixing
+tail, `LogisticApm` (`AdaptiveProbMap.go`), the shared arithmetic coder
+(`BinaryEntropyCodec.go`), and all four static tables (`STATE_TRANSITIONS`
+x2, `STATE_MAP`, `MATCH_PRED` -- diffed programmatically, byte-for-byte
+identical, not just eyeballed) -- all match. The bitstream version is also
+identical on both sides (kanzi-go's own default is 7, same as this port's
+hardcoded assumption), ruling out a logical-vs-arithmetic-shift mismatch
+on the masked contexts.
+
+The mixer fix, once applied, changed nothing on this corpus (4 MiB blocks
+apparently don't give weights enough room to reach overflow range) -- so
+it's a real fidelity fix, confirmed via the file's own stated intent, but
+not *the* explanation for this gap. With every other line checked and
+matching, whatever's left is likely a much smaller, compounding
+discrepancy invisible to static reading -- the next step would be
+instrumenting both a Go build and this port to dump per-bit predictions
+on the same small input and diffing where they first disagree, which
+wasn't attempted in this pass.
 Not yet root-caused; tracked as a known limitation.
 
 *(An earlier version of this section wrongly attributed part of this gap to
