@@ -1,0 +1,15 @@
+kanzi-rs
+Copyright 2026 the kanzi-rs contributors
+
+This product is a Rust reimplementation ("port") of Kanzi, a lossless
+data compressor, compression codec API and utilities:
+
+    https://github.com/flanglet/kanzi-go
+    Copyright 2011-2026 Frederic Langlet
+
+kanzi-go is licensed under the Apache License, Version 2.0 (see the
+LICENSE file in this repository for the full text). This project
+translates kanzi-go's bitstream format, transforms and entropy coders
+into Rust from scratch and adds Python bindings (via PyO3) on top;
+it is an independent project and is not officially affiliated with,
+endorsed by, or maintained by the kanzi-go project or its author.
