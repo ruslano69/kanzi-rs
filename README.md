@@ -98,6 +98,8 @@ built wheel) plus a random-bytes incompressible baseline — deliberately not
 synthetic/repetitive data, since that's what caught a real encoder bug during
 development (see git log).
 
+See [BENCHMARKS.md](BENCHMARKS.md) for numbers against the Silesia corpus.
+
 ## Status
 
 Levels 0-9 round-trip correctly against both a large real-world corpus and the
