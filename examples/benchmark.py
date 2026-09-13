@@ -4,15 +4,19 @@
 Usage:
     python examples/benchmark.py                 # use real files from this repo
     python examples/benchmark.py file1 file2...   # benchmark specific files
+    python examples/benchmark.py --strict         # exit(1) on any round-trip mismatch
 
 With no arguments, benchmarks real, representative content already sitting in
 this repo instead of made-up data:
   - a random-bytes baseline (the incompressible floor every codec must respect)
-  - the project's own Markdown docs (real English/technical prose)
-  - the Go source this Rust port is based on (real, mixed-content source code)
-  - the compiled kanzi.exe (real native binary / machine code)
-  - the built Python wheel (a real zip archive - already compressed data)
-Any of these that isn't present on disk is skipped rather than faked.
+  - this project's own README (real English prose)
+  - this project's own Rust source (real, mixed-content source code)
+  - verify/kanzi.exe and a built wheel, if present locally (dev-only bonus --
+    both are gitignored, so a fresh clone/CI checkout won't have them)
+Any of these that isn't present on disk is skipped rather than faked. `--strict`
+is what CI uses: same benchmark, but a mismatch fails the job instead of just
+being flagged in the output -- this is the check that would have caught the
+RLT run-length bug fixed in this repo's history.
 """
 import os
 import pathlib
@@ -34,24 +38,28 @@ def human(n: float) -> str:
 
 
 def real_datasets(rust_root: pathlib.Path) -> list[tuple[str, bytes]]:
-    """Collect real files already present in the repo, skipping what's missing."""
-    repo_root = rust_root.parent
+    """Collect real files already present in the repo, skipping what's missing.
+
+    Everything referenced here lives inside this repo (rust_root itself), so
+    this works the same whether it's run from a full clone, a fresh CI
+    checkout, or (as in earlier development) nested inside a larger
+    monorepo checkout -- unlike referencing sibling-repo paths, which
+    silently stop resolving the moment this repo is cloned on its own.
+    """
     datasets: list[tuple[str, bytes]] = [
         ("random bytes (incompressible baseline)", os.urandom(2 * 1024 * 1024))
     ]
 
-    docs = [repo_root / "README.md", repo_root / "OPTIMIZATIONS.md"]
-    docs = [p for p in docs if p.exists()]
-    if docs:
-        blob = b"".join(p.read_bytes() for p in docs)
-        datasets.append((f"project docs ({len(docs)} .md file(s), real prose)", blob))
+    readme = rust_root / "README.md"
+    if readme.exists():
+        datasets.append(("project README (real English prose)", readme.read_bytes()))
 
-    go_dir = repo_root / "v2"
-    go_files = sorted(go_dir.rglob("*.go")) if go_dir.exists() else []
-    if go_files:
-        blob = b"".join(p.read_bytes() for p in go_files)
-        datasets.append((f"Go source code ({len(go_files)} real files)", blob))
+    rs_files = sorted(rust_root.glob("src/*.rs"))
+    if rs_files:
+        blob = b"".join(p.read_bytes() for p in rs_files)
+        datasets.append((f"this project's Rust source ({len(rs_files)} real files)", blob))
 
+    # Dev-only bonus datasets: gitignored, so only present if built locally.
     exe_path = rust_root / "verify" / "kanzi.exe"
     if exe_path.exists():
         datasets.append(("native binary (kanzi.exe, real machine code)", exe_path.read_bytes()))
@@ -63,12 +71,15 @@ def real_datasets(rust_root: pathlib.Path) -> list[tuple[str, bytes]]:
     return datasets
 
 
-def benchmark(name: str, data: bytes) -> None:
+def benchmark(name: str, data: bytes) -> bool:
+    """Runs the benchmark for one dataset; returns True iff every level's
+    round trip matched the input."""
     print(f"\n=== {name}  ({human(len(data))}) ===")
     header = f"{'level':>5} | {'size':>10} | {'ratio':>6} | {'saved':>7} | {'enc MB/s':>9} | {'dec MB/s':>9}"
     print(header)
     print("-" * len(header))
 
+    all_ok = True
     mib = 1024 * 1024
     for level in LEVELS:
         best_enc = best_dec = None
@@ -95,11 +106,16 @@ def benchmark(name: str, data: bytes) -> None:
         )
         if mismatch:
             row += "   !! ROUND-TRIP MISMATCH - output does not match input"
+            all_ok = False
         print(row)
+
+    return all_ok
 
 
 def main() -> None:
     args = sys.argv[1:]
+    strict = "--strict" in args
+    args = [a for a in args if a != "--strict"]
 
     if args:
         datasets = [(pathlib.Path(p).name, pathlib.Path(p).read_bytes()) for p in args]
@@ -107,8 +123,13 @@ def main() -> None:
         rust_root = pathlib.Path(__file__).resolve().parent.parent
         datasets = real_datasets(rust_root)
 
+    all_ok = True
     for name, data in datasets:
-        benchmark(name, data)
+        all_ok &= benchmark(name, data)
+
+    if strict and not all_ok:
+        print("\n--strict: at least one round-trip mismatch above, failing.", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

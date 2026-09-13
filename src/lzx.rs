@@ -515,7 +515,23 @@ impl LzxCodec {
                 }
 
                 let width = ((token >> 3) & 3) as usize;
-                let value = u32::from_be_bytes(src[m_idx..m_idx + 4].try_into().unwrap());
+                let avail = count - m_idx;
+                // Only the top `width` bytes of `value` are ever used (see
+                // dist_shift below) -- Go's original always reads a full
+                // uint32 here (LZCodec.go), relying on scratch-buffer slop
+                // that survives past the officially-counted match section;
+                // this port's exact-length buffers don't provide that, so
+                // for the tail entry (avail < 4, always avail >= width)
+                // read only what's really there and zero-fill the rest,
+                // which cannot change `dist` since those bytes are shifted
+                // away regardless of their value.
+                let value = if avail >= 4 {
+                    u32::from_be_bytes(src[m_idx..m_idx + 4].try_into().unwrap())
+                } else {
+                    let mut buf = [0u8; 4];
+                    buf[..avail].copy_from_slice(&src[m_idx..count]);
+                    u32::from_be_bytes(buf)
+                };
                 dist = ((value >> dist_shift[width]) as i64) + dist_bias[width];
                 m_idx += width;
             }
