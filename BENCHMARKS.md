@@ -224,6 +224,43 @@ care as everything above it. Not attempted here; flagging it as the
 honest ceiling of the low-risk approach instead of overclaiming a bigger
 win than the data supports.
 
+### CM: the same pass on the biggest remaining cost center, with a real win this time
+
+Per the profiling above, CM (level 7's entropy stage) is the single
+largest cost center measured this session (44-59% of block time) --
+bigger than SA construction ever was. Unlike `sbrt.rs`/`srt.rs`,
+`cm.rs`'s `CmPredictor::get()`/`update()` had never been touched: every
+one of its `counter1`/`counter2` array accesses used plain checked `[]`
+indexing. These two methods run once per *bit* (8x per byte, for the
+whole block) -- more call volume than anything else profiled this
+session -- with 3-4 indexed reads/writes each, so the bounds-check
+surface per byte is larger than SRT's.
+
+Converted both to `get_unchecked`/`get_unchecked_mut`: `ctx` (the trie
+position within the current byte's 8-bit walk) is provably in `1..=255`
+for the whole walk (`update()` resets it to 1 right after it would
+exceed 255, before the next byte starts), which bounds every derived
+index (`pc1`, `pc2`, plus the `+256`/`+c1`/`+c2`/`+idx`/`+idx+1` offsets)
+well inside `counter1`'s and `counter2`'s fixed sizes -- see the safety
+comment in `cm.rs` for the exact arithmetic. Full test suite and a real
+41MB file's round-trip verified before and after; output size unchanged.
+
+**Result: ~17% faster** (measured the same way as SRT's check -- a
+`BinaryEntropyEncoder<CmPredictor>` driven directly by real BWT output
+from `webster`, isolated from the rest of the pipeline, before/after with
+the same harness: 2288ms -> 1893ms for 3 reps over ~41MB). This is by far
+the best return of the three bounds-check-elimination passes done this
+session after divsufsort.rs itself (SRT's was ~4%), consistent with the
+theory above: more array accesses per call than SRT, on tables (`256*257`
+and `512*17` `i32`s, ~1MB combined) too large to stay fully cache-resident
+the way SRT's 256-byte arrays do, so each removed check saves more than a
+branch-predictor cycle. Still nowhere near the ~30%-of-gap divsufsort.rs
+saw against native C++, since CM's tables are far smaller than
+divsufsort's multi-megabyte scratch arrays and its access pattern has
+much better locality (`ctx` walks a fixed 8-level trie per byte, not an
+arbitrary computed offset) -- there's simply less latency for a bounds
+check to hide behind here than in DivSufSort's double indirection.
+
 ## silesia.tar
 
 Test machine: AMD Ryzen 9 5950X (16C/32T), all-core fixed at 4000 MHz, 4x DIMM

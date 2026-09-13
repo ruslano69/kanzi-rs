@@ -55,6 +55,21 @@ impl CmPredictor {
 }
 
 impl Predictor for CmPredictor {
+    // get()/update() run once per *bit* (8x per byte) for the whole block,
+    // making this project's hottest per-call safe-indexing site (CM is the
+    // level 7 entropy stage, 44-59% of block time per BENCHMARKS.md's
+    // profiling section -- far more call volume than anything upstream of
+    // it). Bounds-check-eliminated like divsufsort.rs/srt.rs: `ctx` stays
+    // in 1..=255 for the duration of any single byte's 8-bit walk (it only
+    // ever reaches >255 right after the walk completes, at which point
+    // update() resets it to 1 before the next byte starts), so `pc1_base`
+    // (`ctx`) and `pc2_base` (`ctx | run_mask`, run_mask is 0 or 0x100) are
+    // always < 512; `pc1 = pc1_base*257 <= 255*257`, well inside
+    // `counter1`'s `256*257` length even with the `+256`/`+c1`/`+c2` (u8,
+    // <256) offsets added. `pc2 = pc2_base*17 <= 511*17`, inside
+    // `counter2`'s `512*17` length even with `+idx+1` added, since
+    // `idx = p>>12` is a bucket index into the 17-slot (16 buckets + one
+    // boundary) table `new()` initializes, i.e. always <= 15.
     fn get(&mut self) -> i32 {
         let ctx = self.ctx;
         let pc2_base = (ctx | self.run_mask) as usize;
@@ -63,17 +78,19 @@ impl Predictor for CmPredictor {
         let pc1 = (pc1_base << 8) + pc1_base;
         let c1tab = &self.counter1;
         let c2tab = &self.counter2;
-        let p = (13i64 * (c1tab[pc1 + 256] as i64 + c1tab[pc1 + self.c1 as usize] as i64)
-            + 6 * c1tab[pc1 + self.c2 as usize] as i64)
-            >> 5;
+        let p = unsafe {
+            (13i64 * (*c1tab.get_unchecked(pc1 + 256) as i64 + *c1tab.get_unchecked(pc1 + self.c1 as usize) as i64)
+                + 6 * *c1tab.get_unchecked(pc1 + self.c2 as usize) as i64)
+                >> 5
+        };
         let idx = (p >> 12) as usize;
         // Go mutates `this.idx` inside Get() -- it's a read-side-effect
         // consumed by the *following* Update() call (must be captured from
         // THIS Get() call, before any Update() runs). `&mut self` here
         // makes that direct, same as Go.
         self.idx = idx;
-        let x2 = c2tab[pc2 + idx + 1] as i64;
-        let x1 = c2tab[pc2 + idx] as i64;
+        let x2 = unsafe { *c2tab.get_unchecked(pc2 + idx + 1) as i64 };
+        let x1 = unsafe { *c2tab.get_unchecked(pc2 + idx) as i64 };
         ((p + p + 3 * (x1 + x2) + 64) >> 7) as i32
     }
 
@@ -87,18 +104,24 @@ impl Predictor for CmPredictor {
         let idx = self.idx;
         let mut new_ctx = ctx;
 
-        if bit == 0 {
-            self.counter1[pc1 + 256] -= self.counter1[pc1 + 256] >> CM_FAST_RATE;
-            self.counter1[c1] -= self.counter1[c1] >> CM_MEDIUM_RATE;
-            self.counter2[pc2 + idx] -= self.counter2[pc2 + idx] >> CM_SLOW_RATE;
-            self.counter2[pc2 + idx + 1] -= self.counter2[pc2 + idx + 1] >> CM_SLOW_RATE;
-            new_ctx = new_ctx.wrapping_add(new_ctx);
-        } else {
-            self.counter1[pc1 + 256] -= (self.counter1[pc1 + 256] - CM_PSCALE + 16) >> CM_FAST_RATE;
-            self.counter1[c1] -= (self.counter1[c1] - CM_PSCALE + 16) >> CM_MEDIUM_RATE;
-            self.counter2[pc2 + idx] -= (self.counter2[pc2 + idx] - CM_PSCALE + 16) >> CM_SLOW_RATE;
-            self.counter2[pc2 + idx + 1] -= (self.counter2[pc2 + idx + 1] - CM_PSCALE + 16) >> CM_SLOW_RATE;
-            new_ctx = new_ctx.wrapping_add(new_ctx).wrapping_add(1);
+        unsafe {
+            if bit == 0 {
+                *self.counter1.get_unchecked_mut(pc1 + 256) -= *self.counter1.get_unchecked(pc1 + 256) >> CM_FAST_RATE;
+                *self.counter1.get_unchecked_mut(c1) -= *self.counter1.get_unchecked(c1) >> CM_MEDIUM_RATE;
+                *self.counter2.get_unchecked_mut(pc2 + idx) -= *self.counter2.get_unchecked(pc2 + idx) >> CM_SLOW_RATE;
+                *self.counter2.get_unchecked_mut(pc2 + idx + 1) -=
+                    *self.counter2.get_unchecked(pc2 + idx + 1) >> CM_SLOW_RATE;
+                new_ctx = new_ctx.wrapping_add(new_ctx);
+            } else {
+                *self.counter1.get_unchecked_mut(pc1 + 256) -=
+                    (*self.counter1.get_unchecked(pc1 + 256) - CM_PSCALE + 16) >> CM_FAST_RATE;
+                *self.counter1.get_unchecked_mut(c1) -= (*self.counter1.get_unchecked(c1) - CM_PSCALE + 16) >> CM_MEDIUM_RATE;
+                *self.counter2.get_unchecked_mut(pc2 + idx) -=
+                    (*self.counter2.get_unchecked(pc2 + idx) - CM_PSCALE + 16) >> CM_SLOW_RATE;
+                *self.counter2.get_unchecked_mut(pc2 + idx + 1) -=
+                    (*self.counter2.get_unchecked(pc2 + idx + 1) - CM_PSCALE + 16) >> CM_SLOW_RATE;
+                new_ctx = new_ctx.wrapping_add(new_ctx).wrapping_add(1);
+            }
         }
 
         self.ctx = new_ctx;
