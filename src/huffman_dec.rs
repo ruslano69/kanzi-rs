@@ -11,7 +11,20 @@ const MAX_SYMBOL_SIZE: u32 = 12;
 const DECODING_MASK: usize = (1usize << MAX_SYMBOL_SIZE) - 1;
 const TABLE_SIZE: usize = 1usize << MAX_SYMBOL_SIZE;
 const HUF_CHUNK_SIZE: usize = 1 << 14;
-const BUFFER_SIZE: usize = 2 * HUF_CHUNK_SIZE;
+// Ported from kanzi-cpp's HuffmanDecoder.cpp (this port's own base is
+// kanzi-go, whose decodeChunkV6 pads/bounds-checks every `read_state`
+// refill instead): kanzi-cpp reserves `HUFFMAN_FRAGMENT_GUARD_BYTES`
+// bytes of genuine slack at the end of each of the 4 fragment streams
+// (`_bufferSize` itself is sized `minBufSize = 2*chunkSize +
+// 4*GUARD_BYTES`, larger than a bare `2*chunkSize`), so `read_state`'s
+// 8-byte refill can be an ordinary read with no per-call padding dance --
+// the trailing bytes it may (harmlessly) read into are guaranteed
+// present and pre-zeroed. See `read_state`'s doc comment for the
+// safety argument this depends on and `decode_chunk_v6`'s new
+// `max_frag_bits` check (present in kanzi-cpp, absent from the
+// kanzi-go-derived code here before this).
+const HUFFMAN_FRAGMENT_GUARD_BYTES: usize = 8;
+const BUFFER_SIZE: usize = 2 * HUF_CHUNK_SIZE + 4 * HUFFMAN_FRAGMENT_GUARD_BYTES;
 
 const FULL_ALPHABET: u32 = 0;
 const ALPHABET_0: u32 = 1;
@@ -152,17 +165,26 @@ fn build_decoding_table(sizes: &[u8; 256], codes: &[u16; 256], symbols: &[u8], t
 /// Loads one 8-byte big-endian refill word and folds it into `state`,
 /// exactly like Go's HuffmanDecoder.readState. All arithmetic is Go-uint8
 /// wrapping on purpose (see the wrapping note on the decode loop below).
+///
+/// The load itself is a straight 8-byte read, ported from kanzi-cpp's
+/// `READ_STATE` macro (kanzi-go's own decodeChunkV6 pads/bounds-checks it
+/// per call instead -- the original version of this function did too, see
+/// git history). Safe without per-call padding because `decode_chunk_v6`
+/// reserves `HUFFMAN_FRAGMENT_GUARD_BYTES` of always-present, always-zeroed
+/// slack past every fragment's real payload (see `BUFFER_SIZE`'s doc
+/// comment): `idx` only ever advances within one fragment's own
+/// `frag_stride` span -- the outer decode loop's trip count is bounded by
+/// the *trusted* chunk size, not by any attacker-controlled stream-length
+/// field, so a corrupted bitstream can desynchronize *which* bits get
+/// decoded but not push `idx` past where a well-formed one would reach.
+/// Still an ordinary bounds-checked slice read (not `get_unchecked`): if
+/// this reasoning is ever wrong for some input this project's fuzzing
+/// hasn't hit, the failure mode is a clean panic (caught by
+/// `decode_blocks_parallel`'s worker-panic net), never memory unsafety.
 #[inline]
 fn read_state(buffer: &[u8], state: &mut u64, idx: &mut usize, bits: u8) -> u8 {
     let shift: u8 = (56u8.wrapping_sub(bits)) & !7u8;
-    // Zero-padded load: valid streams always have the bytes (stride layout
-    // + guard clearing guarantee it); corrupt input must fail safely via the
-    // end-of-chunk size validation, never via undefined behavior (Go would
-    // panic on slice bounds here).
-    let mut w = [0u8; 8];
-    let avail = buffer.len().saturating_sub(*idx).min(8);
-    w[..avail].copy_from_slice(&buffer[*idx..*idx + avail]);
-    let word = u64::from_be_bytes(w);
+    let word = u64::from_be_bytes(buffer[*idx..*idx + 8].try_into().unwrap());
     // Go: (*state << shift) | (word >> (64-shift)). Go shifts with count>=64
     // yield 0 (no panic); Rust panics in debug on overshift, so guard both
     // shift==0 (>>64) and shift>=64 explicitly.
@@ -292,8 +314,28 @@ impl HuffmanDecoderV6 {
         let sz_bits2 = read_var_int(br) as usize;
         let sz_bits3 = read_var_int(br) as usize;
 
-        let stride = self.buffer.len() / 4;
-        let (base0, base1, base2, base3) = (0usize, stride, 2 * stride, 3 * stride);
+        // Port of kanzi-cpp's `fragCapacity`/`fragStride`/`maxFragBits`
+        // (kanzi-go's decodeChunkV6, this port's original base, has no
+        // such split -- see BUFFER_SIZE's doc comment). `frag_capacity` is
+        // the real payload room per stream; `frag_stride` adds
+        // `HUFFMAN_FRAGMENT_GUARD_BYTES` of guaranteed-present, always-
+        // zeroed slack after it so `read_state` can do a plain 8-byte read
+        // with no per-call bounds dance. `max_frag_bits` -- absent from
+        // the pre-existing kanzi-go-derived code -- is checked *before*
+        // any `read_array`/buffer write below, closing a real gap: without
+        // it a corrupted `sz_bits0` larger than one fragment's capacity
+        // would let `read_array` silently overwrite a neighboring
+        // fragment's region instead of failing cleanly.
+        let frag_capacity = (self.buffer.len() - 4 * HUFFMAN_FRAGMENT_GUARD_BYTES) / 4;
+        let frag_stride = frag_capacity + HUFFMAN_FRAGMENT_GUARD_BYTES;
+        let max_frag_bits = frag_capacity * 8;
+
+        if sz_bits0 > max_frag_bits || sz_bits1 > max_frag_bits || sz_bits2 > max_frag_bits || sz_bits3 > max_frag_bits
+        {
+            return Err("Invalid bitstream: Huffman fragment too large".to_string());
+        }
+
+        let (base0, base1, base2, base3) = (0usize, frag_stride, 2 * frag_stride, 3 * frag_stride);
         let (mut idx0, mut idx1, mut idx2, mut idx3) = (base0, base1, base2, base3);
 
         br.read_array(&mut self.buffer[idx0..], sz_bits0);
@@ -304,7 +346,12 @@ impl HuffmanDecoderV6 {
         // Match Go's decodeChunkV6 guard clearing: read_state always loads a
         // full 8-byte big-endian word, so bytes past each stream's payload
         // end must read as deterministic zeros, not stale data from a
-        // previous chunk reusing this buffer.
+        // previous chunk reusing this buffer. Unlike before, this is now
+        // an unconditional 8-byte fill (not clamped to a shared `stride`):
+        // `max_frag_bits` above guarantees
+        // `sz + HUFFMAN_FRAGMENT_GUARD_BYTES <= idx + frag_stride` for
+        // every one of the 4 streams, so it always lands fully inside that
+        // stream's own guard region, never spilling into the next one.
         for (idx, sz_bits) in [
             (idx0, sz_bits0),
             (idx1, sz_bits1),
@@ -312,10 +359,7 @@ impl HuffmanDecoderV6 {
             (idx3, sz_bits3),
         ] {
             let sz = idx + ((sz_bits + 7) >> 3);
-            let end = (sz + 8).min(idx + stride);
-            if sz < end {
-                self.buffer[sz..end].fill(0);
-            }
+            self.buffer[sz..sz + HUFFMAN_FRAGMENT_GUARD_BYTES].fill(0);
         }
 
         let mut state0 = 0u64;

@@ -1689,6 +1689,9 @@ fn apply_inverse_transforms(
         let skip_utf = skip_flags & 0x40 != 0;
         let skip_text = skip_flags & 0x80 != 0;
 
+        let trace = std::env::var("DECTRACE").is_ok();
+        let t0 = std::time::Instant::now();
+
         let stage = if skip_lzx {
             buffer.to_vec()
         } else {
@@ -1697,7 +1700,9 @@ fn apply_inverse_transforms(
             dst.truncate(n);
             dst
         };
+        let t_lzx = t0.elapsed();
 
+        let t1 = std::time::Instant::now();
         let stage = if skip_mm {
             stage
         } else {
@@ -1706,7 +1711,9 @@ fn apply_inverse_transforms(
             dst.truncate(n);
             dst
         };
+        let t_mm = t1.elapsed();
 
+        let t2 = std::time::Instant::now();
         let stage = if skip_pack {
             stage
         } else {
@@ -1715,7 +1722,9 @@ fn apply_inverse_transforms(
             dst.truncate(n);
             dst
         };
+        let t_pack = t2.elapsed();
 
+        let t3 = std::time::Instant::now();
         let stage = if skip_utf {
             stage
         } else {
@@ -1724,15 +1733,31 @@ fn apply_inverse_transforms(
             dst.truncate(n);
             dst
         };
+        let t_utf = t3.elapsed();
 
-        if skip_text {
+        let t4 = std::time::Instant::now();
+        let result = if skip_text {
             Ok(stage)
         } else {
             let mut dst = vec![0u8; dst_cap];
             let (_, back_len) = text_codec::inverse(&stage, &mut dst, block_size, false)?;
             dst.truncate(back_len);
             Ok(dst)
+        };
+        let t_text = t4.elapsed();
+
+        if trace {
+            eprintln!(
+                "DEC3 stages(us): lzx={} mm={} pack={} utf={} text={}",
+                t_lzx.as_micros(),
+                t_mm.as_micros(),
+                t_pack.as_micros(),
+                t_utf.as_micros(),
+                t_text.as_micros()
+            );
         }
+
+        result
     } else if transform_type == l4_type {
         // slot0=TEXT, slot1=UTF, slot2=EXE, slot3=PACK, slot4=MM, slot5=ROLZ.
         // All six inverses are ported (see text_codec.rs, utf.rs, exe.rs,
@@ -2504,5 +2529,38 @@ mod tests {
         // Rust source (this project's own) as a second, differently-shaped
         // real-content sample: lots of ASCII, braces, and identifiers.
         assert_roundtrips_all_levels(include_bytes!("rlt.rs"));
+    }
+
+    #[test]
+    fn roundtrip_crlf_text() {
+        // text_codec.rs's inverse() has a fast bulk-copy path for the
+        // common (LF-only) case that is deliberately skipped whenever a
+        // block is CRLF-flagged (`st.is_crlf`), since an LF byte there
+        // expands to two output bytes (CR+LF) and the fast path assumes a
+        // strict 1:1 src->dst mapping -- this pins that gate down: CRLF
+        // content must keep decoding correctly via the untouched
+        // byte-at-a-time path, not just LF-only content.
+        let mut state: u64 = 0xC0FF_EE00_1234_5678;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let words = [
+            "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "hello", "world", "test", "data",
+            "compress", "decompress", "kanzi",
+        ];
+        let mut text = String::new();
+
+        while text.len() < 200_000 {
+            for _ in 0..10 {
+                text.push_str(words[(next() as usize) % words.len()]);
+                text.push(' ');
+            }
+            text.push_str("\r\n");
+        }
+
+        assert_roundtrips_all_levels(text.as_bytes());
     }
 }

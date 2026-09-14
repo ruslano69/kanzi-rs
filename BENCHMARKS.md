@@ -772,3 +772,367 @@ and it was worth doing before reaching for either.
   predictor `get()`/`update()` (heavier than CM's, with the SSE stage and
   hashed contexts) has never been checked for the same bounds-check
   opportunity CM's `get()`/`update()` already got.
+
+## Decode thread pool: work-stealing, then BiPSIv2 -- the cheap test paid for the expensive one
+
+Follow-up session, branch `decode-thread-pool`, picking up where the L5/L7
+session above left off: "the remaining wall-clock gap to kanzi-cpp is
+decode-side threading". Two changes landed, in the order they were tried.
+
+### Work-stealing over a static block split (~35-40% on skewed files)
+
+`decode_blocks_parallel`'s per-call `std::thread::scope` handed every
+worker a **static** contiguous range of block indices (`chunk =
+ceil(len/workers)`), which only balances load if every block costs the
+same to decode -- false in general (block cost is content-dependent, per
+the CM-entropy numbers in the section above: 0.06ms to 251ms on
+same-sized blocks). Replaced with work-stealing over one shared
+`AtomicUsize` cursor: every worker `fetch_add`-claims the next unclaimed
+span index until none remain. No new pool primitive, no `unsafe` -- each
+worker still just returns its own `(index, result)` pairs through the
+scoped `spawn`'s return value, claiming indices dynamically instead of a
+precomputed range. Panic attribution changes shape (a panicking worker's
+claimed-but-lost indices aren't a known contiguous range anymore, so
+every `results` slot still empty after all workers join gets backfilled
+with that panic's message instead).
+
+Measured on a purpose-built adversarial file (96 MiB, 24 blocks, level 7,
+first 3 blocks text-like/CM-heavy landing in one static worker's range,
+rest LZP-crushed and fast): **~35-40% faster wall clock** (417-509ms ->
+258-335ms best-of-8), byte-identical output, no regression on a
+matched-cost control (all 24 blocks the same cost -- nothing to steal,
+times indistinguishable). `cargo test` green throughout, debug and
+`--release`.
+
+### BiPSIv2, re-ported and actually run in parallel this time
+
+The L6 session's BiPSIv2 attempt (see above) only ever measured it
+**single-threaded** (`BiPSIv2-ST`) against `MergeTPSI-ST`, found it
+*slower*, and reverted the ~350-line port without ever running it the way
+kanzi-cpp actually uses it: `nbTasks = min(jobs, chunks)` real threads,
+each independently decoding its own share of the 8 chunks. That
+comparison -- parallel BiPSIv2 versus sequential MergeTPSI, the one that
+actually matters for closing the gap -- had never been made. This session
+made it.
+
+**Re-porting.** The port isn't in git history (built and reverted within
+the earlier session, never committed), so it was redone from kanzi-cpp's
+current `src/transform/BWT.cpp`/`.hpp` (fetched directly, not
+reconstructed from memory), transcribed type-for-type like
+`divsufsort.rs`. One deliberate deviation from a literal transcription:
+kanzi-cpp shares one raw output buffer across all task threads (safe
+there because each task's writes are provably confined to its own chunk
+range, so no synchronization is needed on the C++ side); this port
+instead hands each task a genuinely disjoint `&mut [u8]` sub-slice via
+`split_at_mut` -- ordinary safe Rust, no `unsafe` anywhere in the port --
+and rebases every absolute-offset quantity by the constant
+`first_chunk * ck_size`, worked out by hand and then pinned down by
+running the differential suite at every thread count 1..=8 (a rebasing
+slip would show up as a thread-count-dependent output change, which
+single-threaded-only testing could never catch).
+
+**Two real bugs, both caught by differential testing before either
+mattered:**
+
+1. kanzi-cpp sizes its `_buffer` scratch array to `max(count + 1, 256)`,
+   not `max(count, 256)` -- one genuinely-used extra slot this port's
+   first pass missed, caught as an index-out-of-bounds panic on the
+   smallest BiPSIv2-eligible size (256 bytes) before the fix.
+2. The `_total` quantity that bounds a chunk group's "is this the
+   globally-short last chunk" check needs to stay **global** (relative to
+   this task's own start, not to the disjoint slice's own length) for the
+   detection itself to stay correct, *and* kanzi-cpp's sequential 1-at-a-
+   time tail loop deliberately overshoots by one byte on a non-final,
+   odd-`ck_size` chunk -- harmless in its shared buffer (the next chunk's
+   own first write overwrites it) but writes into (or past) a different
+   task's disjoint slice here. First fix attempt (making the bound
+   slice-local) broke the short-chunk detection instead and silently
+   dropped a genuinely-needed final byte; the actual fix keeps the global
+   bound and explicitly skips the one-byte overshoot write when it would
+   land outside the current task's own slice. Both bugs were invisible at
+   `threads=1` (no disjoint slicing happens there) and at
+   `threads=chunks=8` with even `ck_size`; caught by testing every thread
+   count 1..=8 against both even- and odd-`ck_size` sizes, matching this
+   project's `divsufsort.rs`-established rigor for anything transcribed
+   rather than re-derived from first principles.
+
+Verified byte-identical against `inverse_merge_tpsi` (the trusted,
+long-tested oracle) at every thread count 1-8, across repetitive, random,
+text-like, all-same-byte and two-symbol-alphabet content, at sizes from
+256 bytes to 8 MiB including both parities of `ck_size = ceil(n/8)`; also
+`cargo test` clean in debug (exercising every `debug_assert!`) and
+`--release`, plus real end-to-end container round-trips through
+`encode5`/`6`/`7` -> `decode` at 8/16/20 MiB block sizes (the last one
+above `inverse_merge_tpsi`'s own 16 MiB hard limit, previously an
+unconditional error -- BiPSIv2 has no such ceiling, so custom block sizes
+above 16 MiB now decode instead of failing loudly).
+
+**The performance picture flipped the earlier finding, and turned out
+more nuanced than "threading helps".** Isolated `Bwt::inverse_*` timing,
+16 MiB blocks, min-of-10:
+
+| Content | MergeTPSI (1 thread) | BiPSIv2 (1 thread) | BiPSIv2 (2/4/6/8 threads) |
+|---|---|---|---|
+| text-like | 263ms | 201ms (**-24%**) | 195/194/193/195ms |
+| random | 229ms | 223ms (-3%) | 207/202/200/202ms |
+| repetitive-64k | 234ms | 194ms (**-17%**) | 184/187/190/200ms |
+
+Two findings, not one:
+
+- **BiPSIv2 is simply a faster algorithm than this port's MergeTPSI at 16
+  MiB, even single-threaded.** This directly contradicts the L6 session's
+  "ties at 16 MiB" finding -- but that finding was about raw algorithm
+  speed on whatever content that session's synthetic files happened to
+  be; this session's 3-way content sweep shows the answer depends heavily
+  on content, so the two aren't actually in conflict, just measuring
+  different points on the same curve.
+- **Threading adds real but small value on top (3-8%), and stops paying
+  past 4-6 threads** (8 threads was worse than 6 in every content type
+  above) -- this machine's memory bandwidth, not spawn cost, is the
+  ceiling for this workload, consistent with BWT inverse's
+  pointer-chasing access pattern saturating memory latency well before
+  it saturates CPU cores. Given threading's small share of the total win
+  and the real implementation cost of lending spare threads across the
+  work-stealing scheduler built above (a task-stealing scheduler with two
+  granularities, block-level and chunk-level, coordinating who currently
+  owns which idle cores), this session shipped **single-threaded BiPSIv2
+  only** and left multi-threaded fan-out as a follow-up, not because it
+  doesn't work (it measurably does) but because the juice was no longer
+  worth the squeeze once the algorithmic win was already banked for free.
+
+**The algorithmic win is not unconditional, though -- size matters as
+much as content.** A separate sweep at smaller sizes, single-threaded,
+random content (the worst case measured):
+
+| Size | MergeTPSI | BiPSIv2 | BiPSIv2 vs MergeTPSI |
+|---|---|---|---|
+| 64 KiB | 0.10ms | 0.81ms | 8x slower |
+| 1 MiB | 4.4ms | 7.9ms | 79% slower |
+| 4 MiB | 36ms | 46ms | 27% slower |
+| 8 MiB | 101ms | 104ms | 2.4% slower |
+| 16 MiB | 228ms | 223ms | 2.5% **faster** |
+
+BiPSIv2's setup phase builds a 65536-entry buckets table and a
+131072-entry fastBits table unconditionally, regardless of block size --
+fixed overhead that dominates small blocks and only amortizes at real
+size. kanzi-cpp itself only switches to BiPSIv2 above 2 MiB
+(`BLOCK_SIZE_THRESHOLD2`); this port's own crossover measures later,
+likely because kanzi-cpp's comparison point (`inverseMergeTPSI`, a
+different implementation of the same algorithm) has different constants.
+
+**Dispatch threshold: 8 MiB, chosen against the worst case, not the best
+one.** At this project's own default block sizes -- L5 4 MiB, L6 8 MiB,
+L7 16 MiB -- picking `BIPSI_THRESHOLD = 8 MiB` means:
+
+- L5 (4 MiB) keeps MergeTPSI: BiPSIv2 loses by up to 27% there on
+  incompressible content, an unacceptable regression risk for a level
+  whose whole point is broad applicability.
+- L6 (8 MiB) switches to BiPSIv2: at most ~2.4% slower in the
+  adversarial (incompressible) case, but a clear double-digit-percent win
+  on any content with real redundancy -- the common case for anything
+  that reached the BWT stage at all (data without redundancy mostly
+  doesn't compress, and the TEXT/UTF/LZP stages ahead of BWT tend to
+  decline rather than pass through content they can't help).
+- L7 (16 MiB) switches to BiPSIv2: wins on both fronts measured, no
+  identified downside.
+
+End-to-end (whole `decode`, not just the BWT stage) wall-clock, real
+container round-trips, min-of-5 on a 16 MiB single block:
+
+| File / level | before (MergeTPSI) | after (BiPSIv2) |
+|---|---|---|
+| L7 text16m | 472-491ms | 456-469ms (~5% faster) |
+| L6 bin16m | 335-344ms | 298-304ms (~11% faster) |
+
+Smaller than the isolated BWT-only percentages above, as expected --
+entropy coding and the other transform stages dilute BWT's share of the
+whole decode, but the win is real and measured at the level a user
+actually experiences.
+
+### Follow-ups (for `NEXT_STEPS.md`)
+
+- Multi-threaded BiPSIv2 fan-out for the "few large blocks, many idle
+  cores" case (e.g. a single 16+ MiB block on an 8-core machine, which
+  today's work-stealing fix cannot help since there's nothing to steal
+  until a file has more than one block in flight) -- the algorithm and
+  the ~3-8%-on-top numbers are already banked above; what's missing is a
+  task-stealing scheduler with two granularities (block-level,
+  chunk-level) that can lend a busy work-stealing worker's idle peers to
+  one large block's BiPSIv2 fan-out without double-booking threads
+  already owned by the block-level scheduler.
+- `BIPSI_THRESHOLD` (8 MiB) was picked from a 3-content-type x
+  size sweep on one machine; a real corpus (Silesia, or this project's
+  own multi-MB real-file fixtures) would pin it down more precisely than
+  synthetic random/text-like/repetitive content did.
+- BiPSIv2's own single-threaded setup-phase cost (buckets/fastBits
+  construction) is unconditional regardless of block size -- if BiPSIv2
+  is ever extended to smaller blocks, that fixed cost is the first thing
+  to look at, not the per-byte walk.
+
+## L2/L3 decode: chasing the biggest ratio gap, not the biggest absolute one
+
+Same session, same machine (Intel i3-12100, 4C/8T, 16 GB RAM -- much
+weaker than the 5950X table above; only relative standing across the
+three implementations is meaningful here, not the absolute numbers).
+Re-running the silesia.tar 3-way comparison from the top of this file on
+this machine surfaced a different signal than the 5950X table: kanzi-rs's
+gap to kanzi-cpp is *largest in relative terms* at the levels that never
+got an optimization pass -- L1 decode 3.2x slower, L2 decode 3.9x slower,
+L3 decode ~2x slower (both encode and decode) -- dwarfing anything at
+L5-9. L3 (`TEXT+UTF+PACK+MM+LZX&HUFFMAN`) was picked as the target: large
+enough in absolute time to measure cleanly, and, per a `DECTRACE`
+breakdown across silesia's real blocks, TEXT (40%), Huffman entropy
+(32%) and LZX (23%) between them account for practically all of it.
+
+### TEXT decode: three attempts, three honest negative results
+
+All three verified byte-identical (full test suite + real silesia.tar
+round-trips) and all three were reverted -- worth recording precisely
+*why* each one failed, since each seemed well-motivated going in:
+
+1. **Bounds-check elimination** on the two hottest branches
+   (`is_text`/`else`, ~78% of loop iterations by a branch-frequency
+   count). No measurable change (before/after both ~472-478ms min on
+   silesia L3) -- the same outcome as `fpaq.rs`'s and the L6 BWT-walk's
+   earlier attempts: the compiler already handles bounds checks this
+   simple.
+2. **Bulk-copy fast path** for runs of "boring" (non-word-ref,
+   non-escape) bytes, splitting the copy from the delimiter/dictionary
+   bookkeeping so each could get simpler, tighter codegen. This one
+   *regressed* (isolated TEXT stage: 523ms baseline -> 542ms). The
+   iteration-count profiling that motivated it was misleading:
+   `word_run` auto-spacing means consecutive dictionary-word references
+   frequently have a zero-length "boring" gap between them, so the fast
+   path's own per-iteration setup cost (compute the run, check
+   `run_len > 0`) fires on almost every iteration for no benefit far
+   more often than it fires productively. Iteration *count* is not
+   iteration *cost* -- a lesson the next attempt also ran into.
+3. **Single combined char-type table**, porting kanzi-cpp's own
+   `TextCodec::CHAR_TYPE`/`getType()` (one `int8[256]` lookup encoding
+   both "is text" and "is delimiter" in one load) to replace this port's
+   two independent checks (`is_text`'s arithmetic range test, then a
+   *separate* `is_delimiter` table only on failure). Structurally sound
+   and exactly what kanzi-cpp does -- but a single noisy measurement
+   (506ms -> 477ms) suggested a win that a proper interleaved 12-rep A/B
+   flatly contradicted (before min=467ms, after min=497ms -- a ~6%
+   *regression*, consistent across the whole distribution). Best
+   explanation: `is_text`'s arithmetic check is pure-register, no memory
+   access, and handles the *majority* of bytes (letters); replacing it
+   with an unconditional table load made the common case slower to save
+   a load on the minority (non-letter) case. What's a win in kanzi-cpp's
+   C++ codegen is not automatically a win in this Rust port's -- matching
+   architecture/language on paper doesn't guarantee matching costs, and
+   *this* is the concrete reason the whole investigation leaned on
+   measurement over "the reference does X" reasoning throughout.
+
+The second and third attempts are also a case study in why this
+project's ablation methodology insists on *interleaved, multi-rep* A/B
+specifically: the very first (single-shot, non-interleaved) measurement
+of attempt 3 pointed the wrong direction entirely, and would have been
+kept as a "win" without the follow-up.
+
+### LZX decode: kanzi-cpp's `dist == 1` special case, ported (kept, small real win)
+
+Comparing `lzx.rs`'s match-copy against kanzi-cpp's `LZXCodec<T>::inverseV7`
+directly: both already use the same 16-byte chunked `copy_within`/
+`KANZI_MEM_CP16` trick for `dist >= 16`, and the same byte-at-a-time
+pointer loop for `2 <= dist < 16` -- but kanzi-cpp special-cases
+`dist == 1` (a single repeated byte, i.e. an RLE run) with `memset`,
+where this port fell through to the generic byte-at-a-time loop for that
+case too. Added the same special case using `slice::fill`. Verified
+byte-identical (full suite, real silesia.tar round-trips at L1/L3/L4,
+plus a purpose-built run-length-heavy 30 MiB stress file). Interleaved
+A/B, 10 reps:
+
+| | on RLE-heavy synthetic content | on real silesia.tar (L3) |
+|---|---|---|
+| before | min 82ms / median 83.5ms | min 460ms / median 483ms |
+| after | min 76ms / median 78ms | min 466ms / median 474ms |
+
+~6-7% faster where `dist == 1` runs are common (padding, sparse data,
+image/executable zero-runs); roughly neutral-to-noise on silesia's actual
+content mix, which doesn't have much of that pattern. Kept regardless --
+zero risk (exact kanzi-cpp-verified semantic match), real upside for
+content that does hit it, no downside for content that doesn't.
+
+### Huffman decode: the guard-byte trick, ported (kept, the real win: ~20% on the entropy stage)
+
+`huffman_dec.rs`'s 4-stream interleaved, table-driven decoder already
+matched kanzi-cpp's structure closely (both are ports of the same
+kanzi-go algorithm) -- but comparing `read_state`'s bit-refill against
+kanzi-cpp's `READ_STATE` macro found one real difference. kanzi-cpp's
+`_bufferSize` is deliberately over-allocated (`minBufSize = 2*chunkSize +
+4*HUFFMAN_FRAGMENT_GUARD_BYTES`, GUARD_BYTES = 8) so each of the 4
+per-stream fragments has genuine, always-zeroed slack past its real
+payload; its bit-refill is then a bare unchecked 8-byte read, safe by
+construction. This port's `BUFFER_SIZE` had no such slack (an even
+4-way split of a bare `2*chunkSize`), so `read_state` instead built a
+zero-padded temporary array with a bounds-checked copy on *every* call --
+a real per-call cost this project's kanzi-go-derived starting point
+never had reason to avoid, since kanzi-go's own implementation pads
+per-call too.
+
+Ported the guard-byte scheme exactly: `BUFFER_SIZE` grows by
+`4*GUARD_BYTES` (32 bytes total, not per-block -- allocated once at
+`HuffmanDecoderV6::new()`), the fragment stride/capacity split changes
+from an even 4-way division to `frag_capacity` (real payload room) +
+`frag_stride = frag_capacity + GUARD_BYTES`, and `read_state` becomes a
+plain (still bounds-*checked*, not `get_unchecked` -- this handles
+untrusted input, so a reasoning slip should panic cleanly rather than
+read out of bounds) 8-byte slice read. Also ported kanzi-cpp's
+`maxFragBits` sanity check, which this port's kanzi-go-derived code
+never had: a real, if minor, robustness gain, not just speed -- without
+it a corrupted fragment-size field could make `read_array` silently
+overwrite a neighboring fragment's region instead of failing cleanly.
+
+Verified: full test suite (debug -- exercises every `debug_assert!` --
+and `--release`), real silesia.tar round-trips at L2 and L3 including a
+debug-mode decode of the full 202 MiB output (most panic-sensitive
+build, real multi-chunk content), and 1000 corrupted-input fuzz trials
+(400 debug-mode on the full silesia-derived L3 stream, 600 release-mode
+on a smaller stream, 1-6 random byte flips per trial) -- **zero panics**,
+corruption caught cleanly every time it was detectable. Interleaved A/B,
+10 reps, isolated entropy-stage timing (`DECTRACE`) on real silesia.tar
+L3:
+
+| | min | median |
+|---|---|---|
+| before | 421.6ms | 447.8ms |
+| after | 336.1ms | 372.4ms |
+
+**~20% faster on the entropy stage itself** -- the single biggest win of
+this investigation, real and substantial. Diluted to ~1.5-2% in
+whole-decode wall clock (460ms->466ms range, barely above noise) by
+Amdahl's law: entropy decode is one of several stages sharing an
+8-thread work-stealing pool with LZX/TEXT/MM/PACK, so a big win isolated
+to one stage shows up small in the number a user actually experiences
+until decode's *other* stages also get the same kind of attention. Kept.
+
+### Follow-ups (for `NEXT_STEPS.md`)
+
+- Huffman's ~20%-on-stage win barely moving whole-decode wall time is
+  itself the headline follow-up: TEXT (40% of L3 decode) and LZX (23%)
+  are still exactly where they were, so closing the *wall-clock* gap
+  needs wins there too, not just more entropy-stage tuning.
+- The TEXT investigation's real per-word cost was never pinned down --
+  three attempts targeted the *hot loop's* checks/copies and all three
+  failed to move the needle, suggesting the cost is genuinely in the
+  dictionary lookup/insert path itself (`dict_map`/`dict_list` indexing)
+  or the per-word hash computation's sheer volume, not the surrounding
+  control flow. Worth direct instrumentation (time the hash+lookup path
+  in isolation) rather than another structural guess.
+- The same guard-byte-slack technique that paid off for Huffman may
+  apply to other checked-refill sites ported from kanzi-go rather than
+  kanzi-cpp -- worth a systematic sweep of this port's other per-call
+  bit/byte-refill functions for the same "kanzi-go pads per call,
+  kanzi-cpp reserves buffer slack and doesn't" pattern before assuming
+  Huffman was a one-off.
+- This session's number of failed attempts (TEXT: 3 of 3; LZX/Huffman: 2
+  of 2 succeeded) versus the L6/L7 session's own failure rate is a data
+  point worth remembering next time: *reading the reference
+  implementation's actual source* (LZX, Huffman) found real,
+  verifiable, safety-reasoned wins; *reasoning from iteration-count
+  profiling alone* (TEXT attempts 1-2) and *assuming feature parity with
+  the reference implies performance parity* (TEXT attempt 3) both failed
+  -- measure, and when possible, read the actual reference code rather
+  than only its measured behavior.

@@ -102,42 +102,68 @@ it.
    one-function-at-a-time rigor `divsufsort.rs`'s remaining checked
    functions call for, not a quick pass.
 
-## Decode thread pool: the cheap test landed, the big one is still open
+## Decode thread pool: two changes landed, one path still open
 
 Follow-up session, on branch `decode-thread-pool`, picked up the
 "persistent pool" idea two paragraphs up. Did the cheap test first
-instead of jumping straight to a pool: `decode_blocks_parallel`'s
-per-call `std::thread::scope` was handing every worker a **static**
-contiguous range of block indices, which only balances load if every
-block costs the same to decode -- false in general (block cost is
-content-dependent, per the CM-entropy numbers above). Replaced it with
-work-stealing over one shared `AtomicUsize` cursor (no new pool
-primitive, no `unsafe`). **~35-40% faster wall clock** on an adversarial
-mixed-content file (skewed so the expensive blocks would all land in one
-static worker's range), byte-identical output, no regression on a
-matched-cost control. Kept; details and numbers in `BENCHMARKS.md`'s
-"Decode thread pool" section.
+instead of jumping straight to a pool, then let its result change the
+plan for the expensive one. Both are kept; full numbers in
+`BENCHMARKS.md`'s "Decode thread pool" section.
 
-This closes the *load-imbalance* half of the gap, but not the
-*single-block* half -- a file with only one span in flight (or one span
-per worker, evenly costed) still decodes exactly as before, since
-work-stealing has nothing to steal until there's more than one worker
-idle. The original single-block BWT-parallelism question -- would a real
-persistent pool (long-lived threads, `'static` task closures, no
-spawn/join per call) let BiPSIv2's chunk-independent fan-out beat
-sequential MergeTPSI where the earlier *scoped* fan-out attempt measured
-strictly worse -- is still open, still bigger, and still has the
-unresolved MLP counter-argument against it (splitting MergeTPSI's 8
-interleaved chains across threads redistributes total memory-level
-parallelism rather than adding to it, so a persistent pool might not
-even be the missing piece for that specific algorithm; BiPSIv2 doesn't
-have that problem but was single-threaded-slower when tried standalone).
-If pursued: needs an owned-buffer or unsafe-lifetime redesign to make
-task closures `'static`-safe across calls, reviving the once-reverted
-BiPSIv2 port specifically for the chunk-parallel case (keep MergeTPSI for
-single-threaded, since it's faster there), and the same fuzz/differential
-rigor already applied to `divsufsort.rs` before trusting it on real
-bitstreams.
+**1. Work-stealing over a static block split.**
+`decode_blocks_parallel`'s per-call `std::thread::scope` was handing
+every worker a **static** contiguous range of block indices, which only
+balances load if every block costs the same to decode -- false in
+general (block cost is content-dependent, per the CM-entropy numbers
+above). Replaced with work-stealing over one shared `AtomicUsize` cursor
+(no new pool primitive, no `unsafe`). **~35-40% faster wall clock** on an
+adversarial mixed-content file, byte-identical output, no regression on
+a matched-cost control.
+
+**2. BiPSIv2, re-ported and actually run in parallel this time.** The L6
+session's BiPSIv2 attempt only ever compared it *single-threaded*
+against single-threaded MergeTPSI (found it slower, reverted) -- the
+comparison that actually matters, parallel BiPSIv2 against sequential
+MergeTPSI, had never been made. Re-ported from kanzi-cpp's current
+source (the old port wasn't in git history), this time with a fully safe
+disjoint-slice design (`split_at_mut`, no `unsafe`) instead of the
+original's shared-buffer-plus-implicit-disjointness-proof, and validated
+by a differential suite across every thread count 1-8 (which caught two
+real transcription bugs a single-threaded-only comparison never would
+have: kanzi-cpp's `_buffer` needs `count + 1` slots not `count`, and its
+sequential tail loop's deliberate one-byte overshoot on odd `ck_size` --
+harmless in a shared buffer, harmful against a disjoint slice -- needed
+an explicit skip). Result: **BiPSIv2 is simply a faster algorithm at
+real block sizes, even single-threaded** (this session's 3-content-type
+sweep shows content, not just size, decides the L6 session's "ties at 16
+MiB" finding -- not a contradiction, a different point on the same
+curve). Threading adds a further 3-8% and stops paying past 4-6 threads
+(memory-bandwidth-bound, not spawn-cost-bound, on this machine). Shipped
+**single-threaded BiPSIv2** as the decode dispatch above an empirically-
+chosen `BIPSI_THRESHOLD` (8 MiB, chosen against the *worst* measured
+case -- incompressible content -- not the best): L6/L7's default block
+sizes now use it, L5 (4 MiB) still uses MergeTPSI since BiPSIv2 loses by
+up to 27% there on incompressible content. Also incidentally lifts
+`inverse_merge_tpsi`'s 16 MiB hard block-size ceiling (BiPSIv2 has none)
+for anyone passing a custom block size above it.
+
+**Still open: multi-threaded BiPSIv2 fan-out.** The single-block gap
+this closes is real (~5-11% end-to-end on the measured files) but
+threading's own further 3-8% was left unwired, not because it doesn't
+work (it measurably does, see `BENCHMARKS.md`) but because capturing it
+needs lending a work-stealing worker's currently-idle peers to one large
+block's chunk fan-out without double-booking threads the block-level
+scheduler already owns -- a task-stealing scheduler with two
+granularities (block-level, chunk-level), real added complexity for a
+3-8% top-up on a win that's already banked. If revisited: the algorithm
+side is already done (`Bwt::inverse_bipsiv2` takes a `num_threads`
+parameter today, just always called with `1`); what's missing is purely
+the scheduling integration, most naturally in the "few large blocks,
+many idle cores" case (`spans.len() < workers`) where today's
+block-level work-stealing has nothing to steal in the first place.
+`BIPSI_THRESHOLD` itself is also only sweep-tuned on synthetic content
+(random/text-like/repetitive) on one machine -- a real corpus would pin
+it down more precisely.
 
 ## Scratch reuse (retired)
 
@@ -163,3 +189,39 @@ little. See `BENCHMARKS.md` for numbers.
  - ~~`main.rs` CLI `encodeN` commands default to 4 MiB blocks regardless of
    level~~ -- resolved: `main.rs` now mirrors `lib.rs::default_block_size`
    (4/8/16/32 MiB by level).
+
+## L2/L3 decode: two real wins, one still-open gap
+
+Same session as above, different target: re-running the top-of-file
+silesia.tar 3-way comparison on a second (much weaker, 4C/8T) machine
+showed the *relative* gap to kanzi-cpp is actually largest at L1-L3
+(2-4x), not L5-9 -- those levels never got an optimization pass. L3
+(`TEXT+UTF+PACK+MM+LZX&HUFFMAN`) was the target; full numbers and the
+three-attempts-out-of-three TEXT failure analysis are in
+`BENCHMARKS.md`'s "L2/L3 decode" section.
+
+- **Kept**: LZX's `dist == 1` match-copy special case (ported from
+  kanzi-cpp's `memset`, this port previously fell through to a generic
+  byte-loop) -- small, real, content-dependent win (~6-7% on RLE-heavy
+  content, near-neutral on silesia's actual mix).
+- **Kept, the real win**: Huffman decode's guard-byte buffer slack
+  (ported from kanzi-cpp; this port's kanzi-go-derived buffer sizing had
+  no such margin, paying for a bounds-checked zero-padded copy on every
+  bit-refill instead) -- **~20% faster on the entropy stage itself**,
+  verified against 1000 corrupted-input fuzz trials (zero panics). Also
+  picked up kanzi-cpp's `maxFragBits` sanity check along the way, a real
+  robustness gain this port's kanzi-go-derived code lacked.
+- **Reverted x3**: TEXT decode resisted bounds-check elimination, a
+  bulk-copy restructuring (measured *worse* -- iteration count isn't
+  iteration cost), and porting kanzi-cpp's combined char-type table
+  (measured worse too, once interleaved-A/B'd properly -- a single
+  noisy first measurement had suggested a win). TEXT's real per-word
+  cost is still unlocated; next time, instrument the dictionary
+  lookup/insert path directly instead of guessing from loop structure.
+- **Still open**: Huffman's 20%-on-stage win barely moved whole-decode
+  wall time (diluted across LZX/TEXT/MM/PACK sharing the same 8-thread
+  pool) -- TEXT (40% of L3 decode) and LZX (23%) still need their own
+  wins for the wall-clock number to actually move. Worth checking this
+  port's *other* kanzi-go-derived per-call bit/byte-refill sites for the
+  same "kanzi-go pads per call, kanzi-cpp reserves buffer slack instead"
+  pattern that paid off for Huffman, before assuming it was a one-off.
