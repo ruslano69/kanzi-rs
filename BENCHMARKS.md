@@ -443,41 +443,71 @@ byte for byte.
  below). Decode: C++ 1.5-3x faster (see the investigation). Ratio:
  identical to within framing bytes.
 
- ### Kept: 7 small L6 encode patches (all byte-identical, 27/27 tests)
+ ### Kept: L6 patches (all byte-identical, 27/27 tests)
 
+ Each was A/B'd in isolation before keeping (see "Ablation" below); the
+ per-patch numbers are deliberately stated rather than a single combined
+ figure, because most of the combined win turned out to be one patch.
+
+ - **FPAQ encoder/decoder** (`fpaq.rs`): the 7-iteration bit loop fully
+    unrolled into 8 explicit steps with the range update inlined on
+    locals (no tuple returns), mirroring kanzi-cpp's 8 `encodeBit`
+    calls; same for the decoder's `for _ in 0..8` loop. **Measured
+    ~+3%** on the stage (`fpaqenc` on 32 MiB) -- the single biggest
+    keeper of the batch, despite the earlier bounds-check attempt on the
+    same file having been a no-op.
  - **BWT forward** (`bwt.rs`): the chunk-rank scan did `pos / step`
-   (one IDIV) per suffix; chunk starts are only 1 or 8 known values, so
-   equality checks replace the division entirely. Chunk 0's rank is the
-   primary index by definition. (kanzi-cpp does `(s % step) == 0` per
-   element -- also an IDIV.)
+    (one IDIV) per suffix; chunk starts are only 1 or 8 known values, so
+    equality checks replace the division entirely. Chunk 0's rank is the
+    primary index by definition. (kanzi-cpp does `(s % step) == 0` per
+    element -- also an IDIV.) **Measured ~+0.5-1%** encode.
  - **SRT inverse** (`srt.rs`): ported kanzi-cpp's `r <= 8` unrolled rank
-   shift instead of paying a generic `copy_within` (memmove call) for
-   the common small-rank case.
+    shift instead of paying a generic `copy_within` (memmove call) for
+    the common small-rank case. **Measured neutral** (219 vs 220ms, 144
+    vs 143ms on the test files); kept only because it is a straight port
+    of kanzi-cpp's code (upstream alignment), not for speed.
  - **UTF forward** (`utf.rs`): dropped the separate 4 MiB `present`
-   array; like kanzi-cpp, `alias_map[val] == 0` doubles as the
-   first-occurrence flag. Also sizes the symbol vec like kanzi-cpp
-   (`max(count >> 9, 256)`) instead of a fixed 32768.
- - **`encode_block6`** (`container.rs`): a per-worker `Block6Scratch`
-   reuses the 5 stage buffers across blocks (kanzi-cpp's `ManagedArray`
-   equivalent) instead of ~4x-block-size fresh `vec!`s per block. First
-   attempt sized buffers from `block_len` rather than each stage's
-   *actual* input length -- a stage seeing a too-small buffer declines
-   and silently changes the bitstream (+25% size); fixed by growing
-   each buffer from the real stage length, exactly like the original
-   per-block sizing. (Level 5 was briefly broken the same way by an
-   overlapping edit and restored -- `encode_block5` untouched.)
- - **FPAQ encoder** (`fpaq.rs`): the 7-iteration bit loop fully unrolled
-   into 8 explicit steps with the range update inlined on locals (no
-   tuple returns), mirroring kanzi-cpp's 8 `encodeBit` calls; same for
-   the decoder's `for _ in 0..8` loop.
+    array; like kanzi-cpp, `alias_map[val] == 0` doubles as the
+    first-occurrence flag. Also sizes the symbol vec like kanzi-cpp
+    (`max(count >> 9, 256)`) instead of a fixed 32768. Removes a 4 MiB
+    alloc/call (not separately timed -- removing work can't be slower).
  - **TEXT static dictionary** (`text_codec.rs`, `text_codec1.rs`): the
-   per-call `Box::leak` dictionary copy (an unbounded ~20KB-per-call
-   leak) replaced with a `OnceLock`-cached build shared across calls
-   (same pattern as `tpaq.rs`'s tables), matching kanzi-cpp's shared
-   static dictionary.
+    per-call `Box::leak` dictionary copy (an unbounded ~20KB-per-call
+    leak) replaced with a `OnceLock`-cached build shared across calls
+    (same pattern as `tpaq.rs`'s tables), matching kanzi-cpp's shared
+    static dictionary. Kept as a leak fix regardless of speed.
 
- Combined effect on the files above: ~2-4% encode, ~1-4% decode --
- small, real, and free (zero format risk).
+ ### Ablation: what actually paid, measured one patch at a time
+
+ Interleaved A/B of two separately-built binaries (alternating order
+ each rep so machine drift cancels; min/p25 over 13-21 reps), one patch
+ toggled per pair:
+
+ | Patch | Effect | Verdict |
+ |---|---|---|
+ | FPAQ enc/dec unroll | ~+3% on `fpaqenc` (32 MiB) | keep |
+ | BWT div-free scan | ~+0.5-1% encode | keep |
+ | SRT inverse unroll | neutral (219/220ms, 144/143ms) | keep (upstream port) |
+ | UTF `present` removal | removes 4 MiB alloc (not timed) | keep |
+ | TEXT `OnceLock` dict | leak fix | keep |
+ | `Block6Scratch` buffer reuse | **neutral to ~1-3% slower** | **reverted** |
+ | decode scratch (persistent `Bwt` + ping-pong) | **~1-2% slower** | **reverted** |
+
+ The two reverts are the same finding twice: on this workload the
+ allocator already recycles per-block `vec!`s efficiently (a freed
+ 32 MiB buffer is handed straight back), so buffer reuse buys nothing --
+ and keeping several large buffers live across a worker's lifetime, plus
+ the output copy a ping-pong buffer needs, costs a little. This also
+ retires the earlier "reuse is free" assumption that motivated
+ `Block6Scratch`; the `Block6Scratch` bullet that used to lead this
+ section (including its first-attempt sizing bug) is gone from the
+ tree, but the episode is worth remembering: sizing those buffers from
+ `block_len` instead of each stage's *actual* input length made a stage
+ see a too-small buffer, decline, and silently change the bitstream
+ (+25% size) -- a reminder that "buffer reuse" changes the observable
+ contract of any stage that branches on `dst.len()`.
+
+ Combined effect of the kept set: ~3-4% encode, ~1-2% decode.
 
  ### Investigated, then reverted: L6 decode
 
@@ -523,16 +553,17 @@ byte for byte.
    persistent pool like kanzi-cpp's -- not scope fan-out, not another
    algorithm swap.
 
- ### Follow-ups (for `NEXT_STEPS.md`)
+### Follow-ups (for `NEXT_STEPS.md`)
 
- - `main.rs` CLI `encodeN` commands still default to 4 MiB blocks
-   regardless of level (the Python bindings already do the right
-   per-level default) -- fix or document.
- - Decode-side scratch reuse (`Bwt` + stage buffers per worker, mirroring
-   `Block6Scratch` on encode) to cut per-block allocator traffic and
-   timing variance.
+ - ~~`main.rs` CLI `encodeN` commands still default to 4 MiB blocks
+   regardless of level~~ -- fixed: the CLI now mirrors
+   `lib.rs::default_block_size` (4/8/16/32 MiB by level), so `encode6`
+   without an explicit size produces the same 8 MiB blocks kanzi-cpp
+   does instead of silently losing ratio.
+ - ~~Decode-side scratch reuse~~ -- tried and reverted (see Ablation);
+   the allocator already recycles per-block buffers, reuse cost a copy.
  - A persistent decode thread pool if chunk-level parallelism is ever
-   revisited.
+   revisited (still the one real decode lever).
 
 ### A note on hardware stability at this scale
 
@@ -555,3 +586,124 @@ level 8/9 on hardware you haven't stability-tested this hard before,
 consider enabling a block checksum (this project supports `-x32`/`-x64` at
 the container level; the Python bindings don't expose it yet) so that kind
 of corruption is caught as a clean error instead of passing silently.
+
+## L5/L7 decode: extending the L6 profiling, one real win
+
+The L6 session above only instrumented level 6's decode path. This session
+added the same per-stage `Instant::now()` timers (env-gated behind
+`DECTRACE=1`, printed to stderr -- same style as `STAGETRACE`, kept in the
+tree since the overhead when unset is a handful of `env::var` checks and
+`Instant::now()` calls around 5 stage calls, not inside any hot loop) to
+level 5 (`TEXT+UTF+BWT+RANK+ZRLT & ANS0`) and level 7
+(`LZP+TEXT+UTF+BWT+LZP & CM`), then profiled both the same way L6 was:
+synthetic files (`bin16m`: a 64KB random-byte chunk repeated to 16 MiB;
+`text16m`: ~16 MiB of pseudo-English generated from a fixed word list),
+single 16 MiB block (`encode5`/`encode7 ... 16777216`) so exactly one
+worker decodes it, median/min over several reps.
+
+### Stage breakdown: BWT dominance is data-dependent, not a given
+
+| Level/file | entropy | other stages (largest first) | BWT % of total |
+|---|---|---|---|
+| L5 bin16m | ANS0 1.4ms | bwt 248.5ms, rank 27.5ms, zrlt 3.2ms | ~88% |
+| L5 text16m | ANS0 6.5ms | bwt 73.8ms, rank 44.1ms, text 40.8ms, zrlt 4.1ms | ~44% |
+| L7 bin16m | CM 0.06ms | lzp0 2.9ms, bwt 0.46ms, lzp1 0.42ms | ~12%* |
+| L7 text16m | CM 251.2ms | bwt 122.8ms, text 38.6ms, lzp1 10.8ms | ~29% |
+
+\* L7 bin16m is a degenerate case: LZP crushes the 64KB-periodic input to a
+tiny post-transform payload before CM even runs, so the whole block decodes
+in ~3.8ms and percentages are noisy at that scale.
+
+This confirms L6's finding (BWT inverse dominates) generalizes to highly
+redundant input at L5 and L7 too, but **not** to less-redundant, more
+generic content: on `text16m`, RANK (L5) and especially CM entropy decode
+(L7, 59% of the block) rival or exceed BWT. So "BWT is the bottleneck" is a
+per-workload conclusion, not a per-level one -- and the already-investigated,
+already-closed BWT avenue (see "Decode-side symmetry" in `NEXT_STEPS.md`:
+sequential MergeTPSI is at kanzi-cpp single-threaded parity, further gains
+need a persistent thread pool, not another algorithm swap) isn't the whole
+story for L5/L7 the way it effectively is for most L6 workloads.
+
+### Tried: `binary_entropy.rs`'s refill, kept (~1%)
+
+`BinaryEntropyDecoder` (shared by CM, TPAQ and TPAQX -- `cm.rs`'s
+predictor was already bounds-check-eliminated, per the earlier CM session,
+but the *driver* around it never was) had exactly one checked-indexing site
+left in its hot loop: `read()`'s 4-byte big-endian refill,
+`self.buffer[self.index..self.index+4]`, called on every renormalization
+(roughly once per 4 bytes of *compressed* input consumed). The preceding
+`if self.index + 4 > self.buf_limit { ...; return; }` guard makes the
+in-bounds case provable (`self.buffer` is grown to at least `buf_limit`
+bytes before any chunk is read and never shrunk during the call), so this
+got the same `debug_assert!` + `get_unchecked` treatment as `cm.rs`/
+`srt.rs`/`sbrt.rs`.
+
+Verified byte-identical (round-trips + `cargo test`, both debug and
+`--release`, debug build exercising the `debug_assert!` on top of this
+session's synthetic corpus with no failures). A/B'd interleaved, 19 reps
+each, on `text16m`'s L7 CM-bound block (the case where this loop runs most):
+
+| | min | median |
+|---|---|---|
+| before | 252.3ms | 260.3ms |
+| after | 249.8ms | 257.7ms |
+
+~1% faster, consistently on the same side across three separate measurement
+batches (not just one lucky run) -- small, real, and free (zero behavioral
+risk, `debug_assert!`-guarded). Kept. Benefits L7 (CM) and, by the same
+shared-decoder-loop logic, levels 8/9 (TPAQ/TPAQX), though those weren't
+separately re-measured here. Does not touch L5 (ANS0, a different decoder
+in `ans.rs`) or L6 (FPAQ has its own dedicated, separately-tuned
+implementation in `fpaq.rs`).
+
+### Tried, then reverted: TEXT codec's per-word hash loop
+
+`text_codec.rs`/`text_codec1.rs`'s `inverse()` (the TEXT stage, a real
+contributor at L5/L7 per the table above) never got a bounds-check pass.
+The one loop with an easy, self-contained safety proof is the per-word
+rolling hash computed at each detected delimiter boundary:
+
+```rust
+for i in (da + 3)..src_idx {
+    h1 = h1.wrapping_mul(TC_HASH1) ^ (src[i] as i32).wrapping_mul(TC_HASH2);
+}
+```
+
+(plus the two fixed `src[da+1]`/`src[da+2]` reads before it). Safe because
+the enclosing `if` only reaches this code when `src_idx > delim_anchor + 3`
+i.e. `da + 3 <= src_idx`, and `src_idx <= src_end == src.len()` is the
+outer `while` loop's invariant -- so every index in range is proven
+in-bounds without touching any of the surrounding dictionary-lookup code
+(`dict_map`/`dict_list`, whose index derivations are far less local and
+would need much more care, in the same spirit as `divsufsort.rs`'s
+still-checked functions per `NEXT_STEPS.md`).
+
+Applied identically to both files, verified byte-identical (same test
+procedure as above). A/B'd on both `text16m` L5 (8 reps) and L7 (6 reps): the
+`text=` stage time was statistically indistinguishable before/after in
+both cases (e.g. L7: before median ~39.0ms, after median ~38.9ms, with
+the after-samples scattered on both sides of the before-samples). **No
+measurable gain -- reverted.** Same shape of result as the `fpaq.rs`
+bounds-check attempt and the BWT walk's `get_unchecked` attempt in the L6
+session: a word's hash loop runs only a handful of iterations (word
+lengths are typically single digits) and is a small fraction of the
+per-word work (which also does the dictionary hash-slot lookup, the
+insert-on-miss logic, and the copy-out on hit) -- too little of the total
+for the compiler's already-cheap, well-predicted bounds check to matter.
+Not carrying unsafe code that measures as pure noise; reverted in full.
+
+### Follow-ups (for `NEXT_STEPS.md`)
+
+- If TEXT decode is revisited, the dictionary lookup/insert path
+  (`dict_map`/`dict_list` indexing) is where the real per-word cost lives,
+  not the hash loop -- but its index derivations are less local and would
+  need the same one-function-at-a-time rigor as `divsufsort.rs`'s
+  remaining checked functions, not a quick pass.
+- CM entropy decode dominating L7 on less-redundant content (59% on
+  `text16m` here) means `tpaq.rs`'s never-yet-isolated gap to kanzi-cpp
+  (flagged in `NEXT_STEPS.md` already) matters more than the L6-only
+  profiling suggested -- TPAQ/TPAQX share `binary_entropy.rs`'s driver
+  with CM, so they inherit this session's ~1% win, but their own
+  predictor `get()`/`update()` (heavier than CM's, with the SSE stage and
+  hashed contexts) has never been checked for the same bounds-check
+  opportunity CM's `get()`/`update()` already got.

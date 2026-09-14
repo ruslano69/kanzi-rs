@@ -204,6 +204,18 @@ impl<P: Predictor> BinaryEntropyDecoder<P> {
         }
     }
 
+    // Called on every renormalization (roughly once per 4 bytes of
+    // *compressed* input consumed) -- the one checked-indexing site left in
+    // the shared decode loop that CM/TPAQ/TPAQX all drive (their `get()`/
+    // `update()` are already bounds-check-eliminated; see cm.rs, tpaq.rs).
+    // `self.buffer` is grown to at least `buf_limit` (`sz_bytes`) bytes
+    // before any chunk's bits are read (`read_block`'s two `if
+    // self.buffer.len() < ...` resizes, one for `buf_size` up front, one
+    // for `sz_bytes` per chunk) and never shrunk afterward, so
+    // `buf_limit <= self.buffer.len()` holds for the lifetime of a
+    // `read_block` call; the early return above is exactly the
+    // `index + 4 > buf_limit` case, so past it `index + 4 <= buf_limit <=
+    // self.buffer.len()`.
     fn read(&mut self) {
         self.low = self.low.wrapping_shl(32) & MASK_0_56;
         self.high = (self.high.wrapping_shl(32) | MASK_0_32) & MASK_0_56;
@@ -214,7 +226,15 @@ impl<P: Predictor> BinaryEntropyDecoder<P> {
             return;
         }
 
-        let val = u32::from_be_bytes(self.buffer[self.index..self.index + 4].try_into().unwrap()) as u64;
+        debug_assert!(self.index + 4 <= self.buffer.len());
+        let val = unsafe {
+            u32::from_be_bytes(
+                self.buffer
+                    .get_unchecked(self.index..self.index + 4)
+                    .try_into()
+                    .unwrap(),
+            )
+        } as u64;
         self.current = (self.current.wrapping_shl(32) | val) & MASK_0_56;
         self.index += 4;
     }

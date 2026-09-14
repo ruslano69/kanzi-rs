@@ -37,6 +37,21 @@ use lzx::LzxCodec;
 use std::env;
 use std::fs;
 
+/// Per-level default block size, mirroring `lib.rs::default_block_size`
+/// (and kanzi-go's `BlockCompressor` exactly): levels 0-5 use 4 MiB,
+/// level 6 uses 8 MiB, levels 7-8 use 16 MiB, level 9 uses 32 MiB, so the
+/// adaptive entropy models get more data per block before reset.
+fn default_block_size(level: u32) -> u32 {
+    const BASE: u32 = 4 * 1024 * 1024;
+
+    match level {
+        6 => 2 * BASE,
+        7 | 8 => 4 * BASE,
+        9 => 8 * BASE,
+        _ => BASE,
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -53,7 +68,7 @@ fn main() {
             let block_size: u32 = args
                 .get(4)
                 .map(|s| s.parse().unwrap())
-                .unwrap_or(4 * 1024 * 1024);
+                .unwrap_or_else(|| default_block_size(1));
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level1(&data, block_size, ck_size);
@@ -69,7 +84,7 @@ fn main() {
             let block_size: u32 = args
                 .get(4)
                 .map(|s| s.parse().unwrap())
-                .unwrap_or(4 * 1024 * 1024);
+                .unwrap_or_else(|| default_block_size(2));
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level2(&data, block_size, ck_size);
@@ -99,7 +114,7 @@ fn main() {
             let block_size: u32 = args
                 .get(4)
                 .map(|s| s.parse().unwrap())
-                .unwrap_or(4 * 1024 * 1024);
+                .unwrap_or_else(|| default_block_size(3));
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level3(&data, block_size, ck_size);
@@ -381,7 +396,7 @@ fn main() {
             let block_size: u32 = args
                 .get(4)
                 .map(|s| s.parse().unwrap())
-                .unwrap_or(4 * 1024 * 1024);
+                .unwrap_or_else(|| default_block_size(9));
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level9(&data, block_size, ck_size);
@@ -397,7 +412,7 @@ fn main() {
             let block_size: u32 = args
                 .get(4)
                 .map(|s| s.parse().unwrap())
-                .unwrap_or(4 * 1024 * 1024);
+                .unwrap_or_else(|| default_block_size(8));
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level8(&data, block_size, ck_size);
@@ -413,7 +428,7 @@ fn main() {
             let block_size: u32 = args
                 .get(4)
                 .map(|s| s.parse().unwrap())
-                .unwrap_or(4 * 1024 * 1024);
+                .unwrap_or_else(|| default_block_size(0));
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level0(&data, block_size, ck_size);
@@ -429,7 +444,7 @@ fn main() {
             let block_size: u32 = args
                 .get(4)
                 .map(|s| s.parse().unwrap())
-                .unwrap_or(4 * 1024 * 1024);
+                .unwrap_or_else(|| default_block_size(7));
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level7(&data, block_size, ck_size);
@@ -445,7 +460,7 @@ fn main() {
             let block_size: u32 = args
                 .get(4)
                 .map(|s| s.parse().unwrap())
-                .unwrap_or(4 * 1024 * 1024);
+                .unwrap_or_else(|| default_block_size(6));
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level6(&data, block_size, ck_size);
@@ -461,7 +476,7 @@ fn main() {
             let block_size: u32 = args
                 .get(4)
                 .map(|s| s.parse().unwrap())
-                .unwrap_or(4 * 1024 * 1024);
+                .unwrap_or_else(|| default_block_size(5));
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level5(&data, block_size, ck_size);
@@ -477,7 +492,7 @@ fn main() {
             let block_size: u32 = args
                 .get(4)
                 .map(|s| s.parse().unwrap())
-                .unwrap_or(4 * 1024 * 1024);
+                .unwrap_or_else(|| default_block_size(4));
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level4(&data, block_size, ck_size);

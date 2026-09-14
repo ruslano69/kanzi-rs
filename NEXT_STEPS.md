@@ -73,14 +73,44 @@ it.
    threads. Porting BiPSIv2 itself was tried, verified byte-exact, and
    reverted (slower-or-tied single-threaded at every size through
    16 MiB); details in `BENCHMARKS.md`.
+ - Extended to L5/L7 this session (see `BENCHMARKS.md`'s "L5/L7 decode"
+   section): BWT dominance is data-dependent, not per-level -- it holds on
+   highly redundant input (~88%/~29% of the block at L5/L7 respectively)
+   but RANK (L5) and especially CM entropy decode (L7, up to 59% on a
+   less-redundant synthetic file) can rival or exceed it. Found and kept a
+   real, small win applicable to L7/8/9: `binary_entropy.rs`'s `read()`
+   refill (the one checked-indexing site left in the CM/TPAQ/TPAQX shared
+   decoder driver, `cm.rs`'s predictor itself already having been done)
+   got the same `debug_assert!`+`get_unchecked` treatment, ~1% on CM
+   decode, verified byte-identical. Tried the same treatment on
+   `text_codec.rs`/`text_codec1.rs`'s per-word hash loop (a real
+   contributor at both L5 and L7) and reverted it -- no measurable gain,
+   same shape of negative result as the `fpaq.rs` and BWT-walk attempts:
+   the loop is too small a fraction of the per-word cost (dictionary
+   lookup/insert dominates, not the hash) for the already-cheap bounds
+   check to matter.
+ - TPAQ/TPAQX's own predictor `get()`/`update()` (heavier than CM's --
+   SSE stage, hashed contexts) has never been checked for the same
+   bounds-check opportunity CM's `get()`/`update()` got; CM entropy
+   decode's newly-measured weight at L7 makes this more likely to matter
+   than the L6-only profiling suggested. Not attempted this session.
+ - TEXT decode's dictionary lookup/insert path (`dict_map`/`dict_list`
+   indexing in `text_codec.rs`/`text_codec1.rs`) is where the real
+   per-word cost actually lives (the hash loop tried above wasn't it) --
+   worth a look if TEXT decode is revisited, but its index derivations are
+   less local than the hash loop's and would need the same
+   one-function-at-a-time rigor `divsufsort.rs`'s remaining checked
+   functions call for, not a quick pass.
 
- ## Decode allocation reuse
+## Scratch reuse (retired)
 
- Encode reuses per-worker scratch (`Block6Scratch`); decode still builds
- a fresh `Bwt` plus per-stage `vec!`s per block (~90 MiB of fresh pages
- per 8 MiB block, all first-touched under load). Reusing them per worker
- should cut both allocator traffic and the run-to-run timing variance
- decode shows that encode no longer has.
+Per-worker scratch reuse was tried on both encode (`Block6Scratch`) and
+decode (`DecodeScratch`, persistent `Bwt` + ping-pong stage buffers) and
+both were reverted after interleaved ablation: on this workload the
+system allocator already recycles per-block buffers efficiently, so
+reuse bought nothing and keeping large buffers live across the worker's
+lifetime (plus the copy a ping-pong buffer needs on output) cost a
+little. See `BENCHMARKS.md` for numbers.
 
 ## Housekeeping
 
@@ -93,7 +123,6 @@ it.
    more of the above lands, for one coherent up-to-date picture instead of
    piecing it together from several partial sections measured at
    different points in time.
- - `main.rs` CLI `encodeN` commands default to 4 MiB blocks regardless of
-   level while kanzi-cpp (and this repo's Python bindings) scale the
-   default per level (8 MiB at L6) -- either match the per-level default
-   or document the difference; it silently costs ratio at L6+ today.
+ - ~~`main.rs` CLI `encodeN` commands default to 4 MiB blocks regardless of
+   level~~ -- resolved: `main.rs` now mirrors `lib.rs::default_block_size`
+   (4/8/16/32 MiB by level).
