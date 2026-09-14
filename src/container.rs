@@ -1689,6 +1689,9 @@ fn apply_inverse_transforms(
         let skip_utf = skip_flags & 0x40 != 0;
         let skip_text = skip_flags & 0x80 != 0;
 
+        let trace = std::env::var("DECTRACE").is_ok();
+        let t0 = std::time::Instant::now();
+
         let stage = if skip_lzx {
             buffer.to_vec()
         } else {
@@ -1697,7 +1700,9 @@ fn apply_inverse_transforms(
             dst.truncate(n);
             dst
         };
+        let t_lzx = t0.elapsed();
 
+        let t1 = std::time::Instant::now();
         let stage = if skip_mm {
             stage
         } else {
@@ -1706,7 +1711,9 @@ fn apply_inverse_transforms(
             dst.truncate(n);
             dst
         };
+        let t_mm = t1.elapsed();
 
+        let t2 = std::time::Instant::now();
         let stage = if skip_pack {
             stage
         } else {
@@ -1715,7 +1722,9 @@ fn apply_inverse_transforms(
             dst.truncate(n);
             dst
         };
+        let t_pack = t2.elapsed();
 
+        let t3 = std::time::Instant::now();
         let stage = if skip_utf {
             stage
         } else {
@@ -1724,15 +1733,31 @@ fn apply_inverse_transforms(
             dst.truncate(n);
             dst
         };
+        let t_utf = t3.elapsed();
 
-        if skip_text {
+        let t4 = std::time::Instant::now();
+        let result = if skip_text {
             Ok(stage)
         } else {
             let mut dst = vec![0u8; dst_cap];
             let (_, back_len) = text_codec::inverse(&stage, &mut dst, block_size, false)?;
             dst.truncate(back_len);
             Ok(dst)
+        };
+        let t_text = t4.elapsed();
+
+        if trace {
+            eprintln!(
+                "DEC3 stages(us): lzx={} mm={} pack={} utf={} text={}",
+                t_lzx.as_micros(),
+                t_mm.as_micros(),
+                t_pack.as_micros(),
+                t_utf.as_micros(),
+                t_text.as_micros()
+            );
         }
+
+        result
     } else if transform_type == l4_type {
         // slot0=TEXT, slot1=UTF, slot2=EXE, slot3=PACK, slot4=MM, slot5=ROLZ.
         // All six inverses are ported (see text_codec.rs, utf.rs, exe.rs,
@@ -1810,6 +1835,9 @@ fn apply_inverse_transforms(
         let skip_utf = skip_flags & 0x40 != 0;
         let skip_text = skip_flags & 0x80 != 0;
 
+        let trace = std::env::var("DECTRACE").is_ok();
+        let t0 = std::time::Instant::now();
+
         let stage = if skip_zrlt {
             buffer.to_vec()
         } else {
@@ -1818,9 +1846,11 @@ fn apply_inverse_transforms(
             dst.truncate(n);
             dst
         };
+        let t_zrlt = t0.elapsed();
 
         let rank = Sbrt::new_rank();
 
+        let t1 = std::time::Instant::now();
         let stage = if skip_rank {
             stage
         } else {
@@ -1829,7 +1859,9 @@ fn apply_inverse_transforms(
             dst.truncate(n);
             dst
         };
+        let t_rank = t1.elapsed();
 
+        let t2 = std::time::Instant::now();
         let stage = if skip_bwt {
             stage
         } else {
@@ -1839,7 +1871,9 @@ fn apply_inverse_transforms(
             dst.truncate(n);
             dst
         };
+        let t_bwt = t2.elapsed();
 
+        let t3 = std::time::Instant::now();
         let stage = if skip_utf {
             stage
         } else {
@@ -1848,15 +1882,31 @@ fn apply_inverse_transforms(
             dst.truncate(n);
             dst
         };
+        let t_utf = t3.elapsed();
 
-        if skip_text {
+        let t4 = std::time::Instant::now();
+        let result = if skip_text {
             Ok(stage)
         } else {
             let mut dst = vec![0u8; dst_cap];
             let (_, back_len) = text_codec::inverse(&stage, &mut dst, block_size, false)?;
             dst.truncate(back_len);
             Ok(dst)
+        };
+        let t_text = t4.elapsed();
+
+        if trace {
+            eprintln!(
+                "DEC5 stages(us): zrlt={} rank={} bwt={} utf={} text={}",
+                t_zrlt.as_micros(),
+                t_rank.as_micros(),
+                t_bwt.as_micros(),
+                t_utf.as_micros(),
+                t_text.as_micros()
+            );
         }
+
+        result
     } else if transform_type == l6_type {
         // slot0=TEXT, slot1=UTF, slot2=BWT, slot3=SRT, slot4=ZRLT. All five
         // inverses are ported (see text_codec.rs, utf.rs, bwt.rs, srt.rs,
@@ -1927,6 +1977,9 @@ fn apply_inverse_transforms(
         let skip_text = skip_flags & 0x40 != 0;
         let skip_lzp0 = skip_flags & 0x80 != 0;
 
+        let trace = std::env::var("DECTRACE").is_ok();
+        let t0 = std::time::Instant::now();
+
         let stage = if skip_lzp1 {
             buffer.to_vec()
         } else {
@@ -1936,7 +1989,9 @@ fn apply_inverse_transforms(
             dst.truncate(n);
             dst
         };
+        let t_lzp1 = t0.elapsed();
 
+        let t1 = std::time::Instant::now();
         let stage = if skip_bwt {
             stage
         } else {
@@ -1946,7 +2001,9 @@ fn apply_inverse_transforms(
             dst.truncate(n);
             dst
         };
+        let t_bwt = t1.elapsed();
 
+        let t2 = std::time::Instant::now();
         let stage = if skip_utf {
             stage
         } else {
@@ -1955,7 +2012,9 @@ fn apply_inverse_transforms(
             dst.truncate(n);
             dst
         };
+        let t_utf = t2.elapsed();
 
+        let t3 = std::time::Instant::now();
         let stage = if skip_text {
             stage
         } else {
@@ -1964,8 +2023,10 @@ fn apply_inverse_transforms(
             dst.truncate(back_len);
             dst
         };
+        let t_text = t3.elapsed();
 
-        if skip_lzp0 {
+        let t4 = std::time::Instant::now();
+        let result = if skip_lzp0 {
             Ok(stage)
         } else {
             let mut lzp0 = LzpCodec::new();
@@ -1973,7 +2034,21 @@ fn apply_inverse_transforms(
             let (_, n) = lzp0.inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
             dst.truncate(n);
             Ok(dst)
+        };
+        let t_lzp0 = t4.elapsed();
+
+        if trace {
+            eprintln!(
+                "DEC7 stages(us): lzp1={} bwt={} utf={} text={} lzp0={}",
+                t_lzp1.as_micros(),
+                t_bwt.as_micros(),
+                t_utf.as_micros(),
+                t_text.as_micros(),
+                t_lzp0.as_micros()
+            );
         }
+
+        result
     } else if transform_type == l89_type {
         // slot0=EXE, slot1=RLT, slot2=TEXT, slot3=UTF, slot4=DNA/Alias. All
         // five inverses are ported (see exe.rs, rlt.rs, text_codec1.rs,
@@ -2103,6 +2178,9 @@ fn decode_block(
 fn decode_block_payload(br: &mut BitReader, block_header: &BlockHeader, hdr: &StreamHeader, pre_len: usize) -> Result<Vec<u8>, String> {
     let mut buffer = vec![0u8; pre_len];
 
+    let trace = std::env::var("DECTRACE").is_ok();
+    let t_entropy0 = std::time::Instant::now();
+
     if block_header.transformed_copy {
         // Entropy coding was bypassed for this block (it would have
         // expanded the data) but the transform sequence still ran, so the
@@ -2137,6 +2215,10 @@ fn decode_block_payload(br: &mut BitReader, block_header: &BlockHeader, hdr: &St
             }
             other => return Err(format!("Unsupported entropy type: {}", other)),
         }
+    }
+
+    if trace {
+        eprintln!("DEC entropy(us): type={} t={}", hdr.entropy_type, t_entropy0.elapsed().as_micros());
     }
 
     apply_inverse_transforms(
@@ -2221,6 +2303,19 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// written_bits)`, as located by `decode`'s first pass) across up to
 /// `available_parallelism()` threads, returning them in original order.
 ///
+/// Work-stealing, not a static contiguous split: every worker repeatedly
+/// claims the next unclaimed span index off one shared `AtomicUsize`
+/// cursor (`fetch_add` hands out a distinct index to each claimer, so no
+/// two workers ever process the same span) instead of being handed a
+/// fixed `[start, end)` range up front. Blocks vary in decode cost --
+/// content-dependent (BWT/entropy work scales with how compressible the
+/// data is, not just its byte length) and structurally (a trailing
+/// partial block is smaller by construction) -- so a static split can
+/// leave some workers idle while one is still grinding through an
+/// expensive block; work-stealing keeps every worker busy until the last
+/// span is claimed. See `BENCHMARKS.md`'s "decode thread pool" section
+/// for the measurement this replaced the static split on the strength of.
+///
 /// This project's decoders are already extensively hardened against
 /// panicking on corrupted input (see the BWT/ANS/TPAQ robustness audit),
 /// but every decoder here ultimately runs on untrusted bytes, so as a
@@ -2229,7 +2324,14 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// own) and turned into the same kind of `Err` a clean validation failure
 /// would produce, rather than letting it take down the whole process --
 /// a `catch_unwind`-equivalent safety net that this parallel split gives
-/// us for free.
+/// us for free. Unlike the old static split, a panicking worker's
+/// in-flight claim isn't attributable to a known `[start, end)` range
+/// anymore, so instead every `results` slot still `None` after all
+/// workers have joined (whether it was mid-flight in the panicking
+/// worker or simply never reached) is backfilled with that panic's
+/// message -- `fetch_add`'s per-index uniqueness guarantees no slot is
+/// ever left `None` when no panic occurred, so this backfill only ever
+/// triggers in the panic case.
 fn decode_blocks_parallel(data: &[u8], spans: &[(usize, u64)], hdr: &StreamHeader, debug: bool) -> Result<Vec<Vec<u8>>, String> {
     if spans.is_empty() {
         return Ok(Vec::new());
@@ -2251,31 +2353,35 @@ fn decode_blocks_parallel(data: &[u8], spans: &[(usize, u64)], hdr: &StreamHeade
     }
 
     let mut results: Vec<Option<Result<Vec<u8>, String>>> = (0..spans.len()).map(|_| None).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut panic_msg: Option<String> = None;
 
     std::thread::scope(|scope| {
-        let chunk = (spans.len() + workers - 1) / workers;
-        let mut handles = Vec::new();
+        let mut handles = Vec::with_capacity(workers);
 
-        for start in (0..spans.len()).step_by(chunk) {
-            let end = (start + chunk).min(spans.len());
-            let spans_ref = spans;
+        for _ in 0..workers {
+            let next_ref = &next;
 
-            let handle = scope.spawn(move || {
-                let mut local = Vec::with_capacity(end - start);
+            handles.push(scope.spawn(move || {
+                let mut local = Vec::new();
 
-                for i in start..end {
-                    let (pos, written) = spans_ref[i];
+                loop {
+                    let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    if i >= spans.len() {
+                        break;
+                    }
+
+                    let (pos, written) = spans[i];
                     let mut br = BitReader::at_bit_pos(data, pos);
                     local.push((i, decode_block(&mut br, written, hdr, debug)));
                 }
 
                 local
-            });
-
-            handles.push((start, end, handle));
+            }));
         }
 
-        for (start, end, handle) in handles {
+        for handle in handles {
             match handle.join() {
                 Ok(items) => {
                     for (i, res) in items {
@@ -2283,23 +2389,25 @@ fn decode_blocks_parallel(data: &[u8], spans: &[(usize, u64)], hdr: &StreamHeade
                     }
                 }
                 Err(payload) => {
-                    let msg = panic_message(payload.as_ref());
-
-                    for i in start..end {
-                        results[i] = Some(Err(format!(
-                            "decoder worker thread panicked while decoding block {}: {}",
-                            i + 1,
-                            msg
-                        )));
+                    if panic_msg.is_none() {
+                        panic_msg = Some(panic_message(payload.as_ref()));
                     }
                 }
             }
         }
     });
 
+    if let Some(msg) = &panic_msg {
+        for r in results.iter_mut() {
+            if r.is_none() {
+                *r = Some(Err(format!("decoder worker thread panicked: {}", msg)));
+            }
+        }
+    }
+
     results
         .into_iter()
-        .map(|r| r.expect("every block span was assigned to exactly one worker"))
+        .map(|r| r.expect("every block span was claimed exactly once or backfilled after a panic"))
         .collect()
 }
 
@@ -2421,5 +2529,38 @@ mod tests {
         // Rust source (this project's own) as a second, differently-shaped
         // real-content sample: lots of ASCII, braces, and identifiers.
         assert_roundtrips_all_levels(include_bytes!("rlt.rs"));
+    }
+
+    #[test]
+    fn roundtrip_crlf_text() {
+        // text_codec.rs's inverse() has a fast bulk-copy path for the
+        // common (LF-only) case that is deliberately skipped whenever a
+        // block is CRLF-flagged (`st.is_crlf`), since an LF byte there
+        // expands to two output bytes (CR+LF) and the fast path assumes a
+        // strict 1:1 src->dst mapping -- this pins that gate down: CRLF
+        // content must keep decoding correctly via the untouched
+        // byte-at-a-time path, not just LF-only content.
+        let mut state: u64 = 0xC0FF_EE00_1234_5678;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let words = [
+            "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "hello", "world", "test", "data",
+            "compress", "decompress", "kanzi",
+        ];
+        let mut text = String::new();
+
+        while text.len() < 200_000 {
+            for _ in 0..10 {
+                text.push_str(words[(next() as usize) % words.len()]);
+                text.push(' ');
+            }
+            text.push_str("\r\n");
+        }
+
+        assert_roundtrips_all_levels(text.as_bytes());
     }
 }

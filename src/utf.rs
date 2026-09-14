@@ -267,9 +267,11 @@ pub fn forward(
     // 1-3 bit size + (7 or 11 or 16 or 21) bit payload
     // 3 MSBs indicate symbol size (limit map size to 22 bits)
     // 000 -> 7 bits, 001 -> 11 bits, 010 -> 16 bits, 1xx -> 21 bits
+    // Like kanzi-cpp's UTFCodec: `alias_map` doubles as the presence flag
+    // (zeroed up front, so a zero count means "unseen") -- no separate
+    // 4MB `present` array.
     let mut alias_map = vec![0i32; 1 << 22];
-    let mut symb: Vec<(u32, i64)> = Vec::with_capacity(32768);
-    let mut present = vec![false; 1 << 22];
+    let mut symb: Vec<(u32, i64)> = Vec::with_capacity((count >> 9).max(256));
 
     let mut i = start;
 
@@ -283,9 +285,8 @@ pub fn forward(
         ok =
             ok && (s != 4 || ((((src[i + 2] as u16) << 8) | src[i + 3] as u16) & 0xC0C0) == 0x8080);
 
-        if !present[val as usize] {
+        if alias_map[val as usize] == 0 {
             symb.push((val, 0));
-            present[val as usize] = true;
             ok = ok && (symb.len() < 32768);
         }
 

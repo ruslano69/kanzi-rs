@@ -12,8 +12,8 @@
 
 use crate::datatype::DataType;
 use crate::text_codec::{
-    compute_text_stats, create_dictionary, init_delimiter_chars, is_delimiter, is_text,
-    same_words, DictEntry, TC_DICT_EN_1024, TC_ESCAPE_TOKEN1, TC_ESCAPE_TOKEN2, TC_HASH1,
+    compute_text_stats, init_delimiter_chars, is_delimiter, is_text,
+    same_words, DictEntry, TC_ESCAPE_TOKEN1, TC_ESCAPE_TOKEN2, TC_HASH1,
     TC_HASH2, TC_MASK_CRLF, TC_MASK_DT, TC_MASK_LENGTH, TC_MASK_NOT_TEXT, TC_MAX_DICT_SIZE,
     TC_MAX_WORD_LENGTH, TC_THRESHOLD2, CR, LF,
 };
@@ -66,19 +66,14 @@ impl<'a> TextState1<'a> {
         let dict_size = dict_size_for(count);
         let hash_mask = (1i32 << log) - 1;
 
-        // Fresh copy of the static dictionary, leaked so entries can hold
-        // 'static slices while dynamic entries hold slices of src.
-        let static_dict: Vec<DictEntry<'static>> = {
-            let mut dict_bytes = TC_DICT_EN_1024.to_vec();
-            let leaked: &'static mut [u8] =
-                Box::leak(dict_bytes.drain(..).collect::<Vec<u8>>().into_boxed_slice());
-            create_dictionary(leaked, 1024)
-        };
-        let base = static_dict.len();
+        // Shared static dictionary (built once, see
+        // `text_codec::static_dict_entries`).
+        let static_entries = crate::text_codec::static_dict_entries();
+        let base = static_entries.len();
 
         let mut dict_list: Vec<DictEntry<'a>> = Vec::with_capacity(dict_size);
 
-        for e in static_dict.into_iter() {
+        for e in static_entries.iter() {
             dict_list.push(DictEntry {
                 hash: e.hash,
                 data: e.data,

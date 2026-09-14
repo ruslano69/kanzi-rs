@@ -581,6 +581,16 @@ impl LzxCodec {
                         break;
                     }
                 }
+            } else if dist == 1 {
+                // Port of kanzi-cpp's `dist == 1` special case
+                // (LZXCodec<T>::inverseV7: `memset(&dst[dstIdx],
+                // int(dst[ref]), mLen)`): a distance-1 match is a run of
+                // one repeated byte, which `fill` can vectorize instead of
+                // the generic byte-at-a-time copy below (identical result,
+                // since every source byte in that loop would equal
+                // `dst[refv]` anyway once dist == 1).
+                let b = dst[refv as usize];
+                dst[dst_idx as usize..m_end as usize].fill(b);
             } else {
                 for i in 0..m_len {
                     dst[(dst_idx + i) as usize] = dst[(refv + i) as usize];

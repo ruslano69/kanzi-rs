@@ -295,10 +295,25 @@ impl Srt {
                     continue;
                 }
 
-                // Shift ranks down by one: copy is runtime-SIMD memmove,
-                // much faster than a byte-by-byte loop.
+                // Shift ranks down by one. Port of kanzi-cpp's SRT::inverse:
+                // small shifts (the common case -- recent symbols live at
+                // small ranks) are unrolled inline instead of paying a
+                // generic memmove call; large shifts use memmove.
                 let r = r as usize;
-                r2s.copy_within(1..r + 1, 0);
+
+                if r <= 8 {
+                    if r >= 1 { r2s[0] = r2s[1]; }
+                    if r >= 2 { r2s[1] = r2s[2]; }
+                    if r >= 3 { r2s[2] = r2s[3]; }
+                    if r >= 4 { r2s[3] = r2s[4]; }
+                    if r >= 5 { r2s[4] = r2s[5]; }
+                    if r >= 6 { r2s[5] = r2s[6]; }
+                    if r >= 7 { r2s[6] = r2s[7]; }
+                    if r >= 8 { r2s[7] = r2s[8]; }
+                } else {
+                    r2s.copy_within(1..r + 1, 0);
+                }
+
                 r2s[r] = c;
                 c = r2s[0];
             } else {
