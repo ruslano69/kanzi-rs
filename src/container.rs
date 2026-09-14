@@ -2278,6 +2278,19 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// written_bits)`, as located by `decode`'s first pass) across up to
 /// `available_parallelism()` threads, returning them in original order.
 ///
+/// Work-stealing, not a static contiguous split: every worker repeatedly
+/// claims the next unclaimed span index off one shared `AtomicUsize`
+/// cursor (`fetch_add` hands out a distinct index to each claimer, so no
+/// two workers ever process the same span) instead of being handed a
+/// fixed `[start, end)` range up front. Blocks vary in decode cost --
+/// content-dependent (BWT/entropy work scales with how compressible the
+/// data is, not just its byte length) and structurally (a trailing
+/// partial block is smaller by construction) -- so a static split can
+/// leave some workers idle while one is still grinding through an
+/// expensive block; work-stealing keeps every worker busy until the last
+/// span is claimed. See `BENCHMARKS.md`'s "decode thread pool" section
+/// for the measurement this replaced the static split on the strength of.
+///
 /// This project's decoders are already extensively hardened against
 /// panicking on corrupted input (see the BWT/ANS/TPAQ robustness audit),
 /// but every decoder here ultimately runs on untrusted bytes, so as a
@@ -2286,7 +2299,14 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// own) and turned into the same kind of `Err` a clean validation failure
 /// would produce, rather than letting it take down the whole process --
 /// a `catch_unwind`-equivalent safety net that this parallel split gives
-/// us for free.
+/// us for free. Unlike the old static split, a panicking worker's
+/// in-flight claim isn't attributable to a known `[start, end)` range
+/// anymore, so instead every `results` slot still `None` after all
+/// workers have joined (whether it was mid-flight in the panicking
+/// worker or simply never reached) is backfilled with that panic's
+/// message -- `fetch_add`'s per-index uniqueness guarantees no slot is
+/// ever left `None` when no panic occurred, so this backfill only ever
+/// triggers in the panic case.
 fn decode_blocks_parallel(data: &[u8], spans: &[(usize, u64)], hdr: &StreamHeader, debug: bool) -> Result<Vec<Vec<u8>>, String> {
     if spans.is_empty() {
         return Ok(Vec::new());
@@ -2308,31 +2328,35 @@ fn decode_blocks_parallel(data: &[u8], spans: &[(usize, u64)], hdr: &StreamHeade
     }
 
     let mut results: Vec<Option<Result<Vec<u8>, String>>> = (0..spans.len()).map(|_| None).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut panic_msg: Option<String> = None;
 
     std::thread::scope(|scope| {
-        let chunk = (spans.len() + workers - 1) / workers;
-        let mut handles = Vec::new();
+        let mut handles = Vec::with_capacity(workers);
 
-        for start in (0..spans.len()).step_by(chunk) {
-            let end = (start + chunk).min(spans.len());
-            let spans_ref = spans;
+        for _ in 0..workers {
+            let next_ref = &next;
 
-            let handle = scope.spawn(move || {
-                let mut local = Vec::with_capacity(end - start);
+            handles.push(scope.spawn(move || {
+                let mut local = Vec::new();
 
-                for i in start..end {
-                    let (pos, written) = spans_ref[i];
+                loop {
+                    let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    if i >= spans.len() {
+                        break;
+                    }
+
+                    let (pos, written) = spans[i];
                     let mut br = BitReader::at_bit_pos(data, pos);
                     local.push((i, decode_block(&mut br, written, hdr, debug)));
                 }
 
                 local
-            });
-
-            handles.push((start, end, handle));
+            }));
         }
 
-        for (start, end, handle) in handles {
+        for handle in handles {
             match handle.join() {
                 Ok(items) => {
                     for (i, res) in items {
@@ -2340,23 +2364,25 @@ fn decode_blocks_parallel(data: &[u8], spans: &[(usize, u64)], hdr: &StreamHeade
                     }
                 }
                 Err(payload) => {
-                    let msg = panic_message(payload.as_ref());
-
-                    for i in start..end {
-                        results[i] = Some(Err(format!(
-                            "decoder worker thread panicked while decoding block {}: {}",
-                            i + 1,
-                            msg
-                        )));
+                    if panic_msg.is_none() {
+                        panic_msg = Some(panic_message(payload.as_ref()));
                     }
                 }
             }
         }
     });
 
+    if let Some(msg) = &panic_msg {
+        for r in results.iter_mut() {
+            if r.is_none() {
+                *r = Some(Err(format!("decoder worker thread panicked: {}", msg)));
+            }
+        }
+    }
+
     results
         .into_iter()
-        .map(|r| r.expect("every block span was assigned to exactly one worker"))
+        .map(|r| r.expect("every block span was claimed exactly once or backfilled after a panic"))
         .collect()
 }
 

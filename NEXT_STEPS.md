@@ -102,6 +102,43 @@ it.
    one-function-at-a-time rigor `divsufsort.rs`'s remaining checked
    functions call for, not a quick pass.
 
+## Decode thread pool: the cheap test landed, the big one is still open
+
+Follow-up session, on branch `decode-thread-pool`, picked up the
+"persistent pool" idea two paragraphs up. Did the cheap test first
+instead of jumping straight to a pool: `decode_blocks_parallel`'s
+per-call `std::thread::scope` was handing every worker a **static**
+contiguous range of block indices, which only balances load if every
+block costs the same to decode -- false in general (block cost is
+content-dependent, per the CM-entropy numbers above). Replaced it with
+work-stealing over one shared `AtomicUsize` cursor (no new pool
+primitive, no `unsafe`). **~35-40% faster wall clock** on an adversarial
+mixed-content file (skewed so the expensive blocks would all land in one
+static worker's range), byte-identical output, no regression on a
+matched-cost control. Kept; details and numbers in `BENCHMARKS.md`'s
+"Decode thread pool" section.
+
+This closes the *load-imbalance* half of the gap, but not the
+*single-block* half -- a file with only one span in flight (or one span
+per worker, evenly costed) still decodes exactly as before, since
+work-stealing has nothing to steal until there's more than one worker
+idle. The original single-block BWT-parallelism question -- would a real
+persistent pool (long-lived threads, `'static` task closures, no
+spawn/join per call) let BiPSIv2's chunk-independent fan-out beat
+sequential MergeTPSI where the earlier *scoped* fan-out attempt measured
+strictly worse -- is still open, still bigger, and still has the
+unresolved MLP counter-argument against it (splitting MergeTPSI's 8
+interleaved chains across threads redistributes total memory-level
+parallelism rather than adding to it, so a persistent pool might not
+even be the missing piece for that specific algorithm; BiPSIv2 doesn't
+have that problem but was single-threaded-slower when tried standalone).
+If pursued: needs an owned-buffer or unsafe-lifetime redesign to make
+task closures `'static`-safe across calls, reviving the once-reverted
+BiPSIv2 port specifically for the chunk-parallel case (keep MergeTPSI for
+single-threaded, since it's faster there), and the same fuzz/differential
+rigor already applied to `divsufsort.rs` before trusting it on real
+bitstreams.
+
 ## Scratch reuse (retired)
 
 Per-worker scratch reuse was tried on both encode (`Block6Scratch`) and

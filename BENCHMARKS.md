@@ -692,6 +692,71 @@ insert-on-miss logic, and the copy-out on hit) -- too little of the total
 for the compiler's already-cheap, well-predicted bounds check to matter.
 Not carrying unsafe code that measures as pure noise; reverted in full.
 
+### Decode thread pool: the cheap test first, and it paid off
+
+`NEXT_STEPS.md` framed the remaining wall-clock gap as needing "a
+persistent pool like kanzi-cpp's `_pool`, not per-block scoped threads" --
+but that diagnosis was made purely from the single-block benchmarks above
+(one worker, no cross-block scheduling in play at all). Before building an
+actual persistent pool (a bigger, riskier change: `'static` task closures
+over borrowed block data need either an owned-buffer redesign or unsafe
+lifetime extension, and reviving the already-once-reverted BiPSIv2 port
+for its chunk-parallel-friendliness), the cheap thing to check first was
+whether `decode_blocks_parallel`'s existing per-call `std::thread::scope`
+was even being used well: it split `spans` into a **static contiguous
+range per worker** (`chunk = ceil(len/workers)`), which only balances load
+if every block costs the same to decode. It doesn't -- block decode cost
+is content-dependent (this session's own table above shows CM entropy
+decode ranging from 0.06ms to 251ms on same-sized blocks depending on
+redundancy) and structurally uneven (a trailing partial block is smaller
+by construction). A static split can leave most workers idle while one
+grinds through a disproportionately expensive block.
+
+Fix: replaced the static split with work-stealing over one shared
+`AtomicUsize` cursor -- every worker loops `fetch_add(1)` to claim the
+next unclaimed span index until none remain, so no two workers ever
+process the same span, and an idle worker immediately picks up whatever's
+left instead of sitting on a finished static range. This needed no new
+pool primitive and no `unsafe`: each worker still only returns its own
+locally-buffered `(index, result)` pairs through the scoped `spawn`'s
+return value (same shape as before), just claiming indices dynamically
+instead of following a precomputed range. The one behavior change is
+panic attribution: since a panicking worker's claimed-but-lost indices
+aren't a known contiguous range anymore, every `results` slot still
+unfilled after all workers join gets backfilled with that panic's message
+(`fetch_add`'s per-index uniqueness guarantees nothing is left unfilled
+when no panic occurs, so the backfill path only ever triggers on an actual
+panic).
+
+Measured on a purpose-built adversarial case: a 96 MiB file, 24 blocks of
+4 MiB, level 7 -- the first 3 blocks (all landing in one static worker's
+range with 8 cores) are `text16m`-style pseudo-text (CM-entropy-heavy,
+slow), the other 21 are `bin16m`-style 64KB-periodic data (LZP-crushed,
+fast) -- exactly the shape of file that stresses a static split hardest.
+Wall clock, `decode`, alternating reps:
+
+| | static split | work-stealing |
+|---|---|---|
+| range (8 reps) | 417-509ms | 258-335ms |
+| best-of-8 | 417ms | 258ms |
+
+**~35-40% faster** on this workload, byte-identical output, full
+round-trip verified. On a matched-cost control (same file layout, all 24
+blocks `text16m`-style so there's nothing to steal work from) the two
+were statistically indistinguishable (655-700ms both ways) -- no
+regression when there's no imbalance to fix. `cargo test` (debug and
+`--release`) stayed green throughout.
+
+This doesn't close the single-block gap the L6 session measured (that
+block still decodes on one thread either way -- work-stealing only helps
+once a file has more than one span in flight), and it doesn't settle the
+MLP question about whether a real persistent pool could ever help
+MergeTPSI's interleaved-chain walk specifically. But it's a real,
+low-risk win in the common multi-block case (mixed-content archives,
+concatenated files, anything where compressibility isn't uniform
+throughout), it needed neither new unsafe code nor a new pool primitive,
+and it was worth doing before reaching for either.
+
 ### Follow-ups (for `NEXT_STEPS.md`)
 
 - If TEXT decode is revisited, the dictionary lookup/insert path
