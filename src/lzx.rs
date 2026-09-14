@@ -47,12 +47,21 @@ impl LzxCodec {
         }
     }
 
+    /// `idx`-based, not slice-based: every call site in `forward()`'s hot
+    /// match-finding loop passes an `idx` bounded by `src_end = count - 18`
+    /// (or by `anchor <= src_end`, the hash-reinsertion loop after a match --
+    /// see `forward()`'s own comment on that bound), the same reserved
+    /// 18-byte literal-tail margin kanzi-go/kanzi-cpp's algorithm already
+    /// relies on. That margin guarantees `idx + 8 <= src.len()` with room to
+    /// spare everywhere this is called, so the 8-byte load skips the slice
+    /// bounds check kanzi-cpp's own raw-pointer read never pays either.
     #[inline]
-    fn hash(&self, p: &[u8]) -> usize {
+    fn hash(&self, src: &[u8], idx: usize) -> usize {
+        debug_assert!(idx + 8 <= src.len());
         // Go computes this as a wrapping 64-bit multiply (`*` on uint64
         // silently wraps mod 2^64) then keeps the top bits via >>rshift --
         // NOT a widening 128-bit product.
-        let v = u64::from_le_bytes(p[0..8].try_into().unwrap());
+        let v = u64::from_le_bytes(unsafe { src.get_unchecked(idx..idx + 8) }.try_into().unwrap());
 
         if self.extra {
             (v.wrapping_shl(HASH_LSHIFT2).wrapping_mul(HASH_SEED) >> HASH_RSHIFT2) as usize
@@ -130,30 +139,40 @@ impl LzxCodec {
 
         while src_idx < src_end {
             let mut best_len: i64 = 0;
-            let h0 = self.hash(&src[src_idx as usize..]);
+            let h0 = self.hash(src, src_idx as usize);
             let ref0 = self.hashes[h0] as i64;
             self.hashes[h0] = src_idx as i32;
-            let p = u64::from_le_bytes(
-                src[src_idx as usize..src_idx as usize + 8]
-                    .try_into()
-                    .unwrap(),
-            );
+            // Safe by the same `src_idx < src_end` margin as `hash()`
+            // (`src_idx + 8 <= src_end + 8 = src.len() - 10`).
+            debug_assert!(src_idx as usize + 8 <= src.len());
+            let p = u64::from_le_bytes(unsafe { src.get_unchecked(src_idx as usize..src_idx as usize + 8) }.try_into().unwrap());
             let src_idx1 = src_idx + 1;
             let max_match = (src_end - src_idx1).min(MAX_MATCH);
             let mut r = src_idx1 - repd[repd_idx];
             let min_ref = (src_idx - max_dist).max(0);
 
+            // `r`/`refv` reads below (guarded by `> min_ref >= 0`, so always
+            // non-negative) are safe up to `+4` for the same reason: every
+            // value ever stored into `repd`/`self.hashes` is a source
+            // position `<= src_end` (see `hash()`'s and the
+            // hash-reinsertion loop's doc comments), and `r`/`ref0` here are
+            // `<= src_idx1 <= src_end`, so `r/ref0 + 4 <= src_end + 4 =
+            // src.len() - 14`.
             if r > min_ref
-                && (p >> 8) as u32
-                    == u32::from_le_bytes(src[r as usize..r as usize + 4].try_into().unwrap())
+                && (p >> 8) as u32 == {
+                    debug_assert!(r as usize + 4 <= src.len());
+                    u32::from_le_bytes(unsafe { src.get_unchecked(r as usize..r as usize + 4) }.try_into().unwrap())
+                }
             {
                 best_len = find_match(src, src_idx1, r, max_match);
             } else {
                 r = src_idx1 - repd[repd_idx ^ 1];
 
                 if r > min_ref
-                    && (p >> 8) as u32
-                        == u32::from_le_bytes(src[r as usize..r as usize + 4].try_into().unwrap())
+                    && (p >> 8) as u32 == {
+                        debug_assert!(r as usize + 4 <= src.len());
+                        u32::from_le_bytes(unsafe { src.get_unchecked(r as usize..r as usize + 4) }.try_into().unwrap())
+                    }
                 {
                     best_len = find_match(src, src_idx1, r, max_match);
                 }
@@ -166,10 +185,10 @@ impl LzxCodec {
                 let mut matched = false;
 
                 if refv > min_ref
-                    && p as u32
-                        == u32::from_le_bytes(
-                            src[refv as usize..refv as usize + 4].try_into().unwrap(),
-                        )
+                    && p as u32 == {
+                        debug_assert!(refv as usize + 4 <= src.len());
+                        u32::from_le_bytes(unsafe { src.get_unchecked(refv as usize..refv as usize + 4) }.try_into().unwrap())
+                    }
                 {
                     best_len = find_match(src, src_idx, refv, (src_end - src_idx).min(MAX_MATCH));
 
@@ -187,7 +206,7 @@ impl LzxCodec {
 
                 // checkNext
                 if refv != src_idx - repd[0] && refv != src_idx - repd[1] {
-                    let h1 = self.hash(&src[src_idx1 as usize..]);
+                    let h1 = self.hash(src, src_idx1 as usize);
                     let ref1 = self.hashes[h1] as i64;
                     self.hashes[h1] = src_idx1 as i32;
 
@@ -215,7 +234,7 @@ impl LzxCodec {
                     if self.extra {
                         // Check if better match at position+2
                         let src_idx2 = src_idx1 + 1;
-                        let h2 = self.hash(&src[src_idx2 as usize..]);
+                        let h2 = self.hash(src, src_idx2 as usize);
                         let ref2 = self.hashes[h2] as i64;
                         self.hashes[h2] = src_idx2 as i32;
 
@@ -269,7 +288,7 @@ impl LzxCodec {
                     refv -= 1;
                 } else {
                     src_idx += 1;
-                    let h1 = self.hash(&src[src_idx as usize..]);
+                    let h1 = self.hash(src, src_idx as usize);
                     self.hashes[h1] = src_idx as i32;
                 }
             }
@@ -357,15 +376,21 @@ impl LzxCodec {
                 }
             }
 
+            // `anchor` is always <= `src_end`: every `best_len` above came
+            // from `find_match` bounded by a `max_match` derived from
+            // `src_end - <starting index>` (see each call site above), so
+            // `anchor = src_idx + best_len` can never run past `src_end` --
+            // keeping every `hash()` call below inside the same 18-byte
+            // reserved margin `hash()`'s own doc comment relies on.
             anchor = src_idx + best_len;
             let mut hash_idx = src_idx + 1;
 
             while hash_idx + 6 < anchor {
                 let hi = hash_idx as usize;
-                let a = self.hash(&src[hi..]);
-                let b = self.hash(&src[hi + 3..]);
-                let c = self.hash(&src[hi + 5..]);
-                let d = self.hash(&src[hi + 6..]);
+                let a = self.hash(src, hi);
+                let b = self.hash(src, hi + 3);
+                let c = self.hash(src, hi + 5);
+                let d = self.hash(src, hi + 6);
                 self.hashes[a] = hash_idx as i32;
                 self.hashes[b] = (hash_idx + 3) as i32;
                 self.hashes[c] = (hash_idx + 5) as i32;
@@ -374,7 +399,7 @@ impl LzxCodec {
             }
 
             while hash_idx < anchor {
-                let h = self.hash(&src[hash_idx as usize..]);
+                let h = self.hash(src, hash_idx as usize);
                 self.hashes[h] = hash_idx as i32;
                 hash_idx += 1;
             }
@@ -612,17 +637,31 @@ impl LzxCodec {
     }
 }
 
+/// `max_match` is always passed in as `(src_end - src_idx).min(MAX_MATCH)`
+/// by every call site in `forward()` (`src_end = src.len() - 18`), and
+/// `refv` (the match candidate) is always a position `< src_idx` (a
+/// distance-adjusted repeat offset or a hash-table hit, both strictly
+/// backward references -- see `hash()`'s and the `r`/`refv` reads' doc
+/// comments above). So on every loop iteration here, `best_len < max_match
+/// <= src_end - src_idx` gives `src_idx + best_len + 8 <= src_end + 8 <=
+/// src.len()`, and `refv < src_idx` gives the same bound with room to
+/// spare for `refv + best_len + 8`. Skips the bounds check on what is this
+/// function's whole job (an 8-byte compare per iteration, likely the
+/// hottest read pair in the encoder) the same way kanzi-cpp's raw-pointer
+/// version never pays it either.
 fn find_match(src: &[u8], src_idx: i64, refv: i64, max_match: i64) -> i64 {
     let mut best_len = 0i64;
 
     while best_len + 8 <= max_match {
+        debug_assert!((src_idx + best_len) as usize + 8 <= src.len());
+        debug_assert!((refv + best_len) as usize + 8 <= src.len());
         let a = u64::from_le_bytes(
-            src[(src_idx + best_len) as usize..(src_idx + best_len) as usize + 8]
+            unsafe { src.get_unchecked((src_idx + best_len) as usize..(src_idx + best_len) as usize + 8) }
                 .try_into()
                 .unwrap(),
         );
         let b = u64::from_le_bytes(
-            src[(refv + best_len) as usize..(refv + best_len) as usize + 8]
+            unsafe { src.get_unchecked((refv + best_len) as usize..(refv + best_len) as usize + 8) }
                 .try_into()
                 .unwrap(),
         );
