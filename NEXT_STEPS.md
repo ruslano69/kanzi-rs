@@ -1,10 +1,10 @@
 # Next steps
 
-Ideas for future performance/fidelity work, not yet started. See
-`BENCHMARKS.md` for the investigation history, methodology, and honest
-numbers (including negative results) these build on -- in particular the
-DivSufSort port, the native-C++ comparison, the level 5-7 stage
-profiling, and the SRT/CM/FPAQ bounds-check-elimination passes.
+Ideas for future performance/fidelity work, not yet started.
+`BENCHMARKS.md` stays a clean kanzi-rs/kanzi-go/kanzi-cpp benchmark
+record; the investigation history behind the items below (what was
+tried, what measured as a real win, what didn't and why) lives in git
+log instead.
 
 ## Closing the gap to native C++ further
 
@@ -61,7 +61,7 @@ it.
    trait), so decode already benefits automatically -- nothing to do
    there.
  - SRT's `inverse()` (decode) has since had kanzi-cpp's `r <= 8` unrolled
-   rank shift ported (see `BENCHMARKS.md`, L6 session) -- small win, kept.
+   rank shift ported -- small win, kept.
  - BWT inverse dominates L6 decode (~70%/block) and kanzi-cpp beats this
    port there by 1.5-3x on the wall clock via a persistent thread pool +
    chunk fan-out over BiPSIv2 -- while our sequential MergeTPSI measures
@@ -72,9 +72,9 @@ it.
    persistent pool like kanzi-cpp's `_pool`, not per-block scoped
    threads. Porting BiPSIv2 itself was tried, verified byte-exact, and
    reverted (slower-or-tied single-threaded at every size through
-   16 MiB); details in `BENCHMARKS.md`.
- - Extended to L5/L7 this session (see `BENCHMARKS.md`'s "L5/L7 decode"
-   section): BWT dominance is data-dependent, not per-level -- it holds on
+   16 MiB) -- see "Decode thread pool" below for the follow-up session
+   that revisited this and actually ran it in parallel.
+ - Extended to L5/L7 in a later session: BWT dominance is data-dependent, not per-level -- it holds on
    highly redundant input (~88%/~29% of the block at L5/L7 respectively)
    but RANK (L5) and especially CM entropy decode (L7, up to 59% on a
    less-redundant synthetic file) can rival or exceed it. Found and kept a
@@ -107,8 +107,7 @@ it.
 Follow-up session, on branch `decode-thread-pool`, picked up the
 "persistent pool" idea two paragraphs up. Did the cheap test first
 instead of jumping straight to a pool, then let its result change the
-plan for the expensive one. Both are kept; full numbers in
-`BENCHMARKS.md`'s "Decode thread pool" section.
+plan for the expensive one. Both are kept.
 
 **1. Work-stealing over a static block split.**
 `decode_blocks_parallel`'s per-call `std::thread::scope` was handing
@@ -150,7 +149,7 @@ for anyone passing a custom block size above it.
 **Still open: multi-threaded BiPSIv2 fan-out.** The single-block gap
 this closes is real (~5-11% end-to-end on the measured files) but
 threading's own further 3-8% was left unwired, not because it doesn't
-work (it measurably does, see `BENCHMARKS.md`) but because capturing it
+work (it measurably does) but because capturing it
 needs lending a work-stealing worker's currently-idle peers to one large
 block's chunk fan-out without double-booking threads the block-level
 scheduler already owns -- a task-stealing scheduler with two
@@ -173,32 +172,32 @@ both were reverted after interleaved ablation: on this workload the
 system allocator already recycles per-block buffers efficiently, so
 reuse bought nothing and keeping large buffers live across the worker's
 lifetime (plus the copy a ping-pong buffer needs on output) cost a
-little. See `BENCHMARKS.md` for numbers.
+little.
 
 ## Housekeeping
 
  - `python_kanzi/` remains an untracked stray directory in the working
    tree, flagged multiple times this session and never resolved either
    way -- decide whether to delete it or fold it into the project.
- - `BENCHMARKS.md`'s top-of-file 3-way native CLI table (kanzi-rs/
-   kanzi-go/kanzi-cpp on `silesia.tar`) predates all of the divsufsort/CM/
-   SRT work documented later in that same file. Worth a full re-run once
-   more of the above lands, for one coherent up-to-date picture instead of
-   piecing it together from several partial sections measured at
-   different points in time.
+ - ~~`BENCHMARKS.md`'s 3-way native CLI table was stale, predating most
+   of this file's own work~~ -- resolved: re-run on current code (two
+   machines, including a fresh i3-12100 pass after the Huffman/LZX/BiPSIv2
+   work below), file trimmed down to just that benchmark record.
  - ~~`main.rs` CLI `encodeN` commands default to 4 MiB blocks regardless of
    level~~ -- resolved: `main.rs` now mirrors `lib.rs::default_block_size`
    (4/8/16/32 MiB by level).
 
 ## L2/L3 decode: two real wins, one still-open gap
 
-Same session as above, different target: re-running the top-of-file
-silesia.tar 3-way comparison on a second (much weaker, 4C/8T) machine
-showed the *relative* gap to kanzi-cpp is actually largest at L1-L3
-(2-4x), not L5-9 -- those levels never got an optimization pass. L3
-(`TEXT+UTF+PACK+MM+LZX&HUFFMAN`) was the target; full numbers and the
-three-attempts-out-of-three TEXT failure analysis are in
-`BENCHMARKS.md`'s "L2/L3 decode" section.
+Same session as above, different target: re-running the silesia.tar
+3-way comparison on a second (much weaker, 4C/8T) machine showed the
+*relative* gap to kanzi-cpp is actually largest at L1-L3 (2-4x), not
+L5-9 -- those levels never got an optimization pass. L3
+(`TEXT+UTF+PACK+MM+LZX&HUFFMAN`) was the target; the three-attempts-out-
+of-three TEXT failure analysis (bounds-check elimination, a bulk-copy
+restructuring, porting kanzi-cpp's char-type table -- all reverted,
+verified via interleaved A/B) lives in git log, not here or in
+`BENCHMARKS.md`.
 
 - **Kept**: LZX's `dist == 1` match-copy special case (ported from
   kanzi-cpp's `memset`, this port previously fell through to a generic
