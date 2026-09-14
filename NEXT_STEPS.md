@@ -224,3 +224,34 @@ verified via interleaved A/B) lives in git log, not here or in
   port's *other* kanzi-go-derived per-call bit/byte-refill sites for the
   same "kanzi-go pads per call, kanzi-cpp reserves buffer slack instead"
   pattern that paid off for Huffman, before assuming it was a one-off.
+
+## LZX encode: unchecked reads kept (real, small win); match-finding itself untouched
+
+Follow-up: checked whether kanzi-cpp's `forward()` (match-finding) is a
+*different*, faster algorithm than kanzi-go's the way its Huffman/LZX
+*decoders* turned out to be -- it isn't; structurally identical to
+kanzi-go's and this port's own, so there was no "read the C++ source"
+shortcut here. What kanzi-cpp's raw-pointer reads do skip is the bounds
+check on every hash/match-verification load; this port's own `src_end =
+count - 18` bound (the same reserved literal-tail margin kanzi-go/cpp's
+algorithm already relies on) makes that provably safe here too. Applied
+`get_unchecked` + `debug_assert!` to `hash()` (9 call sites) and
+`find_match()`'s 8-byte compare loop (likely the hottest read pair in
+the encoder); left the lazy-matching "checkNext" branch's `best_len`-
+offset reads checked (harder safety proof, lower call frequency, not
+worth the risk for the likely-smaller return). Verified: full suite,
+byte-identical encoded output on real silesia.tar at L1-4, debug-mode
+round-trip on the full 202 MiB corpus (no `debug_assert!` failures).
+Interleaved A/B, 10 reps, L1 (pure LZX, no dilution from other encode
+stages): min 765ms->739ms (~3.4%), median 810.5ms->762.5ms (~5.9%).
+
+Match-finding *choices* (as opposed to how they're verified) were never
+touched -- that's the bigger, riskier option still open: since only the
+*decoder's* token format needs to match kanzi's wire format, not the
+specific matches an encoder chooses, a genuinely different match-finder
+(zstd/lz4-style heuristics, hash chains instead of a single-candidate
+table) could trade some of kanzi-go/cpp's exact compression ratio for
+more encode speed. Not attempted -- bigger scope, and loses the
+"encoded output size matches kanzi-go/cpp to the byte" property this
+project has used throughout as a correctness signal, not just a
+performance one.
