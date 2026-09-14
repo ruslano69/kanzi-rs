@@ -171,24 +171,72 @@ impl Bwt {
         // rank of each chunk-start suffix. This replaces a separate
         // inverse-rank array of n u32 (a full allocation, a random-write
         // scatter and a random-read gather per block) -- the same fusion
-        // kanzi-cpp's DivSufSort::constructBWT does. The per-element
-        // division is hidden behind the streaming SA reads (see
-        // OPTIMIZATIONS.md, "constructBWT ... Lemire fastmod").
+        // kanzi-cpp's DivSufSort::constructBWT does, but division-free:
+        // kanzi-cpp tests `(s % step) == 0` per element (one IDIV per
+        // suffix); here chunk starts are only 1 or 8 known values, so an
+        // equality check against them avoids the IDIV entirely. Chunk 0
+        // always starts at 0, so its rank is p_idx by definition.
         let mut p_idx = 0usize; // rank of suffix 0 (primary index, 0-based)
         let mut chunk_ranks = [0u32; 8];
 
-        for (r, &s) in sa.iter().enumerate() {
-            let pos = s as usize;
-
-            if pos == 0 {
-                p_idx = r;
+        if chunks == 1 {
+            for (r, &s) in sa.iter().enumerate() {
+                if s == 0 {
+                    p_idx = r;
+                    break;
+                }
             }
 
-            let c = pos / step;
+            chunk_ranks[0] = p_idx as u32;
+        } else {
+            // chunks == 8 (the only other value get_bwt_chunks returns).
+            // All 8 starts are < count here: step = ceil(count/8) and
+            // 7*step < count for every count >= 256 (49 < count).
+            let s1 = step;
+            let s2 = step * 2;
+            let s3 = step * 3;
+            let s4 = step * 4;
+            let s5 = step * 5;
+            let s6 = step * 6;
+            let s7 = step * 7;
+            let mut r1 = 0u32;
+            let mut r2 = 0u32;
+            let mut r3 = 0u32;
+            let mut r4 = 0u32;
+            let mut r5 = 0u32;
+            let mut r6 = 0u32;
+            let mut r7 = 0u32;
 
-            if c < chunks && c * step == pos {
-                chunk_ranks[c] = r as u32;
+            for (r, &s) in sa.iter().enumerate() {
+                let pos = s as usize;
+
+                if pos == 0 {
+                    p_idx = r;
+                } else if pos == s1 {
+                    r1 = r as u32;
+                } else if pos == s2 {
+                    r2 = r as u32;
+                } else if pos == s3 {
+                    r3 = r as u32;
+                } else if pos == s4 {
+                    r4 = r as u32;
+                } else if pos == s5 {
+                    r5 = r as u32;
+                } else if pos == s6 {
+                    r6 = r as u32;
+                } else if pos == s7 {
+                    r7 = r as u32;
+                }
             }
+
+            chunk_ranks[0] = p_idx as u32;
+            chunk_ranks[1] = r1;
+            chunk_ranks[2] = r2;
+            chunk_ranks[3] = r3;
+            chunk_ranks[4] = r4;
+            chunk_ranks[5] = r5;
+            chunk_ranks[6] = r6;
+            chunk_ranks[7] = r7;
         }
 
         // BWT payload: [src[n-1]] + predecessors except the primary row.

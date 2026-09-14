@@ -397,10 +397,142 @@ re-running this port with `block_size=16_777_216` (level 8's real default)
 instead of the hardcoded 4 MiB made that difference disappear completely,
 byte for byte.
 
-Fixed in `lib.rs`: `compress()` now defaults to the same per-level block
-size kanzi-go uses, with an optional `block_size` keyword argument to
-override it (matching the CLI's `-b`/`--block`) for anyone who wants a
-specific block size regardless of level.
+ Fixed in `lib.rs`: `compress()` now defaults to the same per-level block
+ size kanzi-go uses, with an optional `block_size` keyword argument to
+ override it (matching the CLI's `-b`/`--block`) for anyone who wants a
+ specific block size regardless of level.
+
+## L6 encode micro-opts vs kanzi-cpp, and the decode investigation
+
+ Level 6 (`TEXT+UTF+BWT+SRT+ZRLT & FPAQ`) optimized against kanzi-cpp as
+ the etalon, then the remaining decode gap investigated the same way.
+ Everything below kept the bitstream byte-identical (verified sizes +
+ round-trips + cross-decoding both directions).
+
+ ### Method and caveats, stated up front
+
+ kanzi-cpp was built from source with MSYS2 GCC 16.1 (`-O3
+ `-march=native`, flags taken from `src/Makefile`) because the MSVC
+ `Kanzi_VS2022.vcxproj` has broken relative source paths (only the lib
+ project builds via MSBuild; the exe project fails with C1083). So this
+ is a GCC-vs-Rust comparison, not the MSVC build the earlier sections
+ use -- expect ±10-20% codegen differences on top of everything else.
+ Test files are synthetic (repeated executable bytes, repeated docs to
+ 16/32 MiB -- chosen so L6 runs 2-4 full 8 MiB blocks), not Silesia, and
+ the box was under load (medians of 10 reported throughout; single
+ numbers below are best-of-11 where noted).
+
+ A measurement footgun found along the way: this repo's CLI
+ (`rust_kanzi encode6`) defaults to **4 MiB** blocks
+ (`unwrap_or(4 * 1024 * 1024)` in `main.rs`), while kanzi-cpp at level 6
+ defaults to **8 MiB**. Early runs compared 4 MiB Rust blocks against
+ 8 MiB C++ blocks and showed a phantom 2x ratio gap (160KB vs 85KB on
+ the same 16 MiB text file) that vanished entirely once both used 8 MiB
+ (85,287 vs 85,291 bytes -- 4 bytes of framing). Every number below uses
+ explicit 8 MiB blocks on both sides (`encode6 in out 8388608`).
+
+ ### Headline numbers (L6, 8 MiB blocks, all cores, median-of-10)
+
+ | File | Rust enc / dec (ms) | C++ enc / dec (ms) | Rust size | C++ size |
+ |---|---|---|---|---|
+ | bin16m (16 MiB exe bytes) | 333 / 568 | 497 / 187 | 1,111,068 | 1,111,072 |
+ | text16m (16 MiB docs) | 193 / 154 | 256 / 106 | 85,287 | 85,291 |
+ | bin32m (32 MiB exe bytes) | 534 / 616 | 704 / 232 | 2,196,491 | 2,196,495 |
+
+ Encode: Rust 1.3-1.5x faster (libsais suffix arrays + the micro-opts
+ below). Decode: C++ 1.5-3x faster (see the investigation). Ratio:
+ identical to within framing bytes.
+
+ ### Kept: 7 small L6 encode patches (all byte-identical, 27/27 tests)
+
+ - **BWT forward** (`bwt.rs`): the chunk-rank scan did `pos / step`
+   (one IDIV) per suffix; chunk starts are only 1 or 8 known values, so
+   equality checks replace the division entirely. Chunk 0's rank is the
+   primary index by definition. (kanzi-cpp does `(s % step) == 0` per
+   element -- also an IDIV.)
+ - **SRT inverse** (`srt.rs`): ported kanzi-cpp's `r <= 8` unrolled rank
+   shift instead of paying a generic `copy_within` (memmove call) for
+   the common small-rank case.
+ - **UTF forward** (`utf.rs`): dropped the separate 4 MiB `present`
+   array; like kanzi-cpp, `alias_map[val] == 0` doubles as the
+   first-occurrence flag. Also sizes the symbol vec like kanzi-cpp
+   (`max(count >> 9, 256)`) instead of a fixed 32768.
+ - **`encode_block6`** (`container.rs`): a per-worker `Block6Scratch`
+   reuses the 5 stage buffers across blocks (kanzi-cpp's `ManagedArray`
+   equivalent) instead of ~4x-block-size fresh `vec!`s per block. First
+   attempt sized buffers from `block_len` rather than each stage's
+   *actual* input length -- a stage seeing a too-small buffer declines
+   and silently changes the bitstream (+25% size); fixed by growing
+   each buffer from the real stage length, exactly like the original
+   per-block sizing. (Level 5 was briefly broken the same way by an
+   overlapping edit and restored -- `encode_block5` untouched.)
+ - **FPAQ encoder** (`fpaq.rs`): the 7-iteration bit loop fully unrolled
+   into 8 explicit steps with the range update inlined on locals (no
+   tuple returns), mirroring kanzi-cpp's 8 `encodeBit` calls; same for
+   the decoder's `for _ in 0..8` loop.
+ - **TEXT static dictionary** (`text_codec.rs`, `text_codec1.rs`): the
+   per-call `Box::leak` dictionary copy (an unbounded ~20KB-per-call
+   leak) replaced with a `OnceLock`-cached build shared across calls
+   (same pattern as `tpaq.rs`'s tables), matching kanzi-cpp's shared
+   static dictionary.
+
+ Combined effect on the files above: ~2-4% encode, ~1-4% decode --
+ small, real, and free (zero format risk).
+
+ ### Investigated, then reverted: L6 decode
+
+ Per-stage decode timers (temporary, not kept) on an 8 MiB binary
+ block: FPAQ ~36ms, ZRLT ~7ms, SRT ~24ms, **BWT inverse ~160ms (70%)**,
+ UTF/TEXT skipped. kanzi-cpp parallelizes exactly this stage
+ (`nbTasks = min(jobs, chunks)` over its BiPSIv2 variant), so:
+
+ - **Parallel MergeTPSI: harmful, with proof.** An 8-thread scoped walk
+   (one chain per thread) measured *slower* than the sequential 8-way
+   interleaved walk at every thread count (1T 45ms, 2T 173ms, 4T 90ms,
+   8T 52ms best-of-11 on a 4 MiB block). The interleaved loop keeps 8
+   independent pointer-chase chains in flight (MLP=8) on one core;
+   splitting chains across threads drops per-thread MLP to 1 while
+   total MLP stays 8 -- threading adds spawn/scheduling cost for zero
+   additional memory parallelism. Reverted; chunk parallelism only pays
+   once per-element work is heavier.
+ - **BiPSIv2 ported (~350 lines), verified, then reverted.**
+   `BWT::inverseBiPSIv2` transcribed 1:1 by type (`int`->`i32`,
+   `uint`->`u32`), differential-tested byte-identical against
+   MergeTPSI (300KB-4MB + repetitive + text-like long runs, even and
+   odd chunk sizes). Along the way it caught a real subtlety:
+   kanzi-cpp's single-chain tail loop performs one overlapping store
+   past the chunk end on odd `ck` (harmless there -- the next chunk
+   overwrites it); a task-sliced port must skip that store instead,
+   which the differential tests with odd chunk sizes now pin down.
+   A/B (sequential, same payloads, two samples): BiPSIv2-ST is slower
+   than MergeTPSI-ST at every size through 12 MiB (2.2x at 300KB down
+   to ~1.1x at 8-12MB) and ties at 16 MiB. Prefetch hints and
+   `get_unchecked` on the walk measured zero on top (same negative
+   result as the earlier FPAQ attempt) and were reverted too. Per the
+   FPAQ precedent -- no reason to carry ~350 lines that buy nothing --
+   the port was reverted; our sequential MergeTPSI independently
+   measures at kanzi-cpp BiPSIv2-ST parity (168 vs ~170-190ms on one
+   8 MiB block, min-of-10).
+ - **Remaining wall gap is threading under load, not algorithm.**
+   Single-threaded Rust and C++ decode the same 8 MiB block within ~10%
+   of each other; the 1.5-3x wall gap comes from kanzi-cpp's persistent
+   thread pool (`_pool`) + chunk fan-out versus this port's per-block
+   scoped threads, measured on a heavily loaded box where spawn storms
+   cost more than they buy (a parallel walk measured 2.2x *worse* than
+   sequential here, while C++ stayed flat). The honest next step is a
+   persistent pool like kanzi-cpp's -- not scope fan-out, not another
+   algorithm swap.
+
+ ### Follow-ups (for `NEXT_STEPS.md`)
+
+ - `main.rs` CLI `encodeN` commands still default to 4 MiB blocks
+   regardless of level (the Python bindings already do the right
+   per-level default) -- fix or document.
+ - Decode-side scratch reuse (`Bwt` + stage buffers per worker, mirroring
+   `Block6Scratch` on encode) to cut per-block allocator traffic and
+   timing variance.
+ - A persistent decode thread pool if chunk-level parallelism is ever
+   revisited.
 
 ### A note on hardware stability at this scale
 

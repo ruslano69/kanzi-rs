@@ -82,6 +82,23 @@ pub(crate) struct DictEntry<'a> {
     pub(crate) ptr: &'a [u8],
 }
 
+/// Shared static dictionary entries, built once (the `create_dictionary`
+/// fold is deterministic over the fixed `TC_DICT_EN_1024` bytes).
+/// Replaces the previous per-call `Box::leak` copy -- which leaked ~20KB
+/// per TEXT call (unbounded growth for long-running processes) -- with a
+/// single `OnceLock`-cached build; per-call setup now just memcpys the
+/// entries (they are `Copy`). Same pattern as `tpaq.rs`'s static tables.
+pub(crate) fn static_dict_entries() -> &'static [DictEntry<'static>] {
+    use std::sync::OnceLock;
+    static ENTRIES: OnceLock<&'static [DictEntry<'static>]> = OnceLock::new();
+    *ENTRIES.get_or_init(|| {
+        let bytes = TC_DICT_EN_1024.to_vec();
+        let leaked: &'static mut [u8] = Box::leak(bytes.into_boxed_slice());
+        let entries: Vec<DictEntry<'static>> = create_dictionary(leaked, 1024);
+        Box::leak(entries.into_boxed_slice())
+    })
+}
+
 #[inline]
 pub(crate) fn same_words(a: &[u8], b: &[u8]) -> bool {
     a.len() <= b.len() && a == &b[..a.len()]
@@ -374,24 +391,13 @@ impl<'a> TextState<'a> {
 
         let hash_mask = (1i32 << log) - 1;
 
-        // Build the static dictionary fresh each call (simplicity over
-        // speed -- this whole implementation prioritizes correctness).
-        let mut dict_bytes = TC_DICT_EN_1024.to_vec();
-        let static_dict: Vec<DictEntry<'static>> = {
-            // SAFETY-free approach: leak the per-call copy so its lifetime
-            // is effectively 'static for the duration of the program. This
-            // trades a small one-time allocation leak per call for a much
-            // simpler lifetime story; acceptable for this correctness-first
-            // port (see module doc: no premature optimization).
-            let leaked: &'static mut [u8] =
-                Box::leak(dict_bytes.drain(..).collect::<Vec<u8>>().into_boxed_slice());
-            create_dictionary(leaked, 1024)
-        };
-        let static_dict_size = static_dict.len();
+        // Shared static dictionary (built once, see `static_dict_entries`).
+        let static_entries = static_dict_entries();
+        let static_dict_size = static_entries.len();
 
         let mut dict_list: Vec<DictEntry<'a>> = Vec::with_capacity(dict_size);
 
-        for e in static_dict.into_iter().take(dict_size.min(1024)) {
+        for e in static_entries.iter().take(dict_size.min(1024)) {
             dict_list.push(DictEntry {
                 hash: e.hash,
                 data: e.data,

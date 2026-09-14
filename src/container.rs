@@ -955,9 +955,10 @@ pub fn encode_level6(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
     let hasher = Hasher::new(ck_size).expect("invalid ck_size");
     write_stream_header(&mut bw, FPAQ_ENTROPY, transform_type, block_size, &hasher);
 
-    let blocks = encode_blocks_parallel(data, block_size, Bwt::new, |bwt, block| {
-        encode_block6(block, bwt, block_size, hasher.checksum(block))
-    });
+    let blocks =
+        encode_blocks_parallel(data, block_size, Block6Scratch::new, |scratch, block| {
+            encode_block6(block, scratch, block_size, hasher.checksum(block))
+        });
 
     for (encoded_block, written) in &blocks {
         write_framed_block(&mut bw, encoded_block, *written);
@@ -969,7 +970,51 @@ pub fn encode_level6(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
     bw.finish()
 }
 
-fn encode_block6(data: &[u8], bwt: &mut Bwt, block_size: u32, checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
+/// Reusable scratch buffers for `encode_block6`, one per worker thread.
+/// Buffers grow to the largest block seen and are reused across blocks --
+/// equivalent to kanzi-cpp's `ManagedArray` reuse in `CompressedOutputStream`.
+/// Sizing rule (critical for byte-identical output): each stage's buffer is
+/// grown from the *actual* previous-stage length, exactly like the original
+/// per-block `vec![0u8; max_encoded_len(stageN.len())]` sizing. Sizing from
+/// `block_len` instead would make a stage see a too-small buffer, decline,
+/// and silently change the bitstream.
+struct Block6Scratch {
+    bwt: Bwt,
+    text_dst: Vec<u8>,
+    utf_dst: Vec<u8>,
+    bwt_dst: Vec<u8>,
+    srt_dst: Vec<u8>,
+    zrlt_dst: Vec<u8>,
+}
+
+impl Block6Scratch {
+    fn new() -> Self {
+        Block6Scratch {
+            bwt: Bwt::new(),
+            text_dst: Vec::new(),
+            utf_dst: Vec::new(),
+            bwt_dst: Vec::new(),
+            srt_dst: Vec::new(),
+            zrlt_dst: Vec::new(),
+        }
+    }
+
+    fn ensure(&mut self, which: usize, cap: usize) {
+        let buf = match which {
+            0 => &mut self.text_dst,
+            1 => &mut self.utf_dst,
+            2 => &mut self.bwt_dst,
+            3 => &mut self.srt_dst,
+            _ => &mut self.zrlt_dst,
+        };
+
+        if buf.len() < cap {
+            buf.resize(cap, 0);
+        }
+    }
+}
+
+fn encode_block6(data: &[u8], scratch: &mut Block6Scratch, block_size: u32, checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
     let block_len = data.len();
 
     if block_len <= SMALL_BLOCK_SIZE {
@@ -977,57 +1022,72 @@ fn encode_block6(data: &[u8], bwt: &mut Bwt, block_size: u32, checksum: Option<(
     }
 
     // Stage 1: TEXT (codec 1 for FPAQ/CM/TPAQ; see Factory.go newToken).
-    let mut text_dst = vec![0u8; text_codec::max_encoded_len(block_len)];
-    let (stage1_out, skip_text, dt_text): (Vec<u8>, u8, DataType) =
-        match text_codec1::forward(data, &mut text_dst, block_size, false) {
-            Ok((_, n, dt)) => {
-                text_dst.truncate(n);
-                (text_dst, 0, dt)
+    scratch.ensure(0, text_codec::max_encoded_len(block_len));
+    let (stage1_len, skip_text, dt_text): (usize, u8, DataType) =
+        match text_codec1::forward(data, &mut scratch.text_dst, block_size, false) {
+            Ok((_, n, dt)) => (n, 0, dt),
+            Err((_, dt)) => {
+                scratch.text_dst[..block_len].copy_from_slice(data);
+                (block_len, 1, dt)
             }
-            Err((_, dt)) => (data.to_vec(), 1, dt),
         };
 
-    // Stage 2: UTF (real implementation, see utf.rs)
-    let mut utf_dst = vec![0u8; utf::max_encoded_len(stage1_out.len())];
-    let (stage2_out, skip_utf): (Vec<u8>, u8) =
-        match utf::forward(&stage1_out, &mut utf_dst, dt_text) {
-            Ok((_, n, _)) => {
-                utf_dst.truncate(n);
-                (utf_dst, 0)
+    // Stage 2: UTF (real implementation, see utf.rs).
+    // Buffer sized from the actual stage-1 length.
+    scratch.ensure(1, utf::max_encoded_len(stage1_len));
+    let (stage2_len, skip_utf): (usize, u8) =
+        match utf::forward(&scratch.text_dst[..stage1_len], &mut scratch.utf_dst, dt_text) {
+            Ok((_, n, _)) => (n, 0),
+            Err(_) => {
+                scratch.utf_dst[..stage1_len].copy_from_slice(&scratch.text_dst[..stage1_len]);
+                (stage1_len, 1)
             }
-            Err(_) => (stage1_out.clone(), 1),
         };
 
-    // Stage 3: BWT (real implementation, see bwt.rs)
-    let mut bwt_dst = vec![0u8; crate::bwt::max_encoded_len(stage2_out.len())];
-    let (stage3_out, skip_bwt): (Vec<u8>, u8) = match bwt.forward(&stage2_out, &mut bwt_dst) {
-        Ok((_, n)) => {
-            bwt_dst.truncate(n);
-            (bwt_dst, 0)
+    // Stage 3: BWT (real implementation, see bwt.rs).
+    // Buffer sized from the actual stage-2 length.
+    scratch.ensure(2, crate::bwt::max_encoded_len(stage2_len));
+    let (stage3_len, skip_bwt): (usize, u8) = match scratch
+        .bwt
+        .forward(&scratch.utf_dst[..stage2_len], &mut scratch.bwt_dst)
+    {
+        Ok((_, n)) => (n, 0),
+        Err(_) => {
+            scratch.bwt_dst[..stage2_len].copy_from_slice(&scratch.utf_dst[..stage2_len]);
+            (stage2_len, 1)
         }
-        Err(_) => (stage2_out.clone(), 1),
     };
 
-    // Stage 4: SRT (real implementation, see srt.rs)
+    // Stage 4: SRT (real implementation, see srt.rs).
+    // Buffer sized from the actual stage-3 length.
+    scratch.ensure(3, Srt::max_encoded_len(stage3_len));
     let srt = Srt::new();
-    let mut srt_dst = vec![0u8; Srt::max_encoded_len(stage3_out.len())];
-    let (stage4_out, skip_srt): (Vec<u8>, u8) = match srt.forward(&stage3_out, &mut srt_dst) {
-        Ok((_, n)) => {
-            srt_dst.truncate(n);
-            (srt_dst, 0)
+    let (stage4_len, skip_srt): (usize, u8) = match srt
+        .forward(&scratch.bwt_dst[..stage3_len], &mut scratch.srt_dst)
+    {
+        Ok((_, n)) => (n, 0),
+        Err(_) => {
+            scratch.srt_dst[..stage3_len].copy_from_slice(&scratch.bwt_dst[..stage3_len]);
+            (stage3_len, 1)
         }
-        Err(_) => (stage3_out.clone(), 1),
     };
 
-    // Stage 5: ZRLT (real implementation, see zrlt.rs)
-    let mut zrlt_dst = vec![0u8; zrlt::max_encoded_len(stage4_out.len())];
-    let (stage5_out, skip_zrlt): (Vec<u8>, u8) = match zrlt::forward(&stage4_out, &mut zrlt_dst) {
-        Ok((_, n)) => {
-            zrlt_dst.truncate(n);
-            (zrlt_dst, 0)
+    // Stage 5: ZRLT (real implementation, see zrlt.rs).
+    // Buffer sized from the actual stage-4 length (ZRLT never expands,
+    // but the decline fallback copies stage-4 verbatim).
+    scratch.ensure(4, zrlt::max_encoded_len(stage4_len).max(stage4_len));
+    let (stage5_len, skip_zrlt): (usize, u8) = match zrlt::forward(
+        &scratch.srt_dst[..stage4_len],
+        &mut scratch.zrlt_dst,
+    ) {
+        Ok((_, n)) => (n, 0),
+        Err(_) => {
+            scratch.zrlt_dst[..stage4_len].copy_from_slice(&scratch.srt_dst[..stage4_len]);
+            (stage4_len, 1)
         }
-        Err(_) => (stage4_out.clone(), 1),
     };
+
+    let stage5_out = &scratch.zrlt_dst[..stage5_len];
 
     // 5-transform sequence: top 5 skip bits used, low 3 stay set.
     let skip_flags: u8 = (skip_text << 7)
@@ -1040,10 +1100,7 @@ fn encode_block6(data: &[u8], bwt: &mut Bwt, block_size: u32, checksum: Option<(
     if std::env::var("STAGETRACE").is_ok() {
         eprintln!(
             "ENC6 lens: text={} bwt={} srt={} zrlt={}",
-            stage1_out.len(),
-            stage3_out.len(),
-            stage4_out.len(),
-            stage5_out.len()
+            stage1_len, stage3_len, stage4_len, stage5_len
         );
     }
 
@@ -2235,10 +2292,10 @@ fn decode_blocks_parallel(data: &[u8], spans: &[(usize, u64)], hdr: &StreamHeade
         return Ok(Vec::new());
     }
 
-    let workers = std::thread::available_parallelism()
+    let cores = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(1)
-        .min(spans.len());
+        .unwrap_or(1);
+    let workers = cores.min(spans.len());
 
     if workers <= 1 {
         return spans

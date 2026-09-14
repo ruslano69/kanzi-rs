@@ -53,27 +53,47 @@ it.
 
 ## Decode-side symmetry
 
-This session's bounds-check-elimination passes (SRT, CM) only touched
-the encode/forward path.
+ This session's bounds-check-elimination passes (SRT, CM) only touched
+ the encode/forward path.
 
-- CM's predictor is shared between encoder and decoder (`get()`/
-  `update()` are the same code either way via the generic `Predictor`
-  trait), so decode already benefits automatically -- nothing to do
-  there.
-- SRT's `inverse()` (decode) was not touched, and wasn't part of this
-  session's measured profile (only encode-side stages were profiled).
-  Worth a quick look for consistency, though FPAQ's negative result
-  suggests decode-side hot loops on small fixed arrays may already be
-  compiler-optimized -- check before assuming a rewrite is worthwhile.
+ - CM's predictor is shared between encoder and decoder (`get()`/
+   `update()` are the same code either way via the generic `Predictor`
+   trait), so decode already benefits automatically -- nothing to do
+   there.
+ - SRT's `inverse()` (decode) has since had kanzi-cpp's `r <= 8` unrolled
+   rank shift ported (see `BENCHMARKS.md`, L6 session) -- small win, kept.
+ - BWT inverse dominates L6 decode (~70%/block) and kanzi-cpp beats this
+   port there by 1.5-3x on the wall clock via a persistent thread pool +
+   chunk fan-out over BiPSIv2 -- while our sequential MergeTPSI measures
+   at its single-threaded parity. A scoped fan-out of either walk was
+   tried and measured strictly worse (spawn storms under load; plus an
+   MLP argument why chain-splitting can't help the MergeTPSI walk at
+   all). If chunk-level decode parallelism is ever revisited, it needs a
+   persistent pool like kanzi-cpp's `_pool`, not per-block scoped
+   threads. Porting BiPSIv2 itself was tried, verified byte-exact, and
+   reverted (slower-or-tied single-threaded at every size through
+   16 MiB); details in `BENCHMARKS.md`.
+
+ ## Decode allocation reuse
+
+ Encode reuses per-worker scratch (`Block6Scratch`); decode still builds
+ a fresh `Bwt` plus per-stage `vec!`s per block (~90 MiB of fresh pages
+ per 8 MiB block, all first-touched under load). Reusing them per worker
+ should cut both allocator traffic and the run-to-run timing variance
+ decode shows that encode no longer has.
 
 ## Housekeeping
 
-- `python_kanzi/` remains an untracked stray directory in the working
-  tree, flagged multiple times this session and never resolved either
-  way -- decide whether to delete it or fold it into the project.
-- `BENCHMARKS.md`'s top-of-file 3-way native CLI table (kanzi-rs/
-  kanzi-go/kanzi-cpp on `silesia.tar`) predates all of the divsufsort/CM/
-  SRT work documented later in that same file. Worth a full re-run once
-  more of the above lands, for one coherent up-to-date picture instead of
-  piecing it together from several partial sections measured at
-  different points in time.
+ - `python_kanzi/` remains an untracked stray directory in the working
+   tree, flagged multiple times this session and never resolved either
+   way -- decide whether to delete it or fold it into the project.
+ - `BENCHMARKS.md`'s top-of-file 3-way native CLI table (kanzi-rs/
+   kanzi-go/kanzi-cpp on `silesia.tar`) predates all of the divsufsort/CM/
+   SRT work documented later in that same file. Worth a full re-run once
+   more of the above lands, for one coherent up-to-date picture instead of
+   piecing it together from several partial sections measured at
+   different points in time.
+ - `main.rs` CLI `encodeN` commands default to 4 MiB blocks regardless of
+   level while kanzi-cpp (and this repo's Python bindings) scale the
+   default per level (8 MiB at L6) -- either match the per-level default
+   or document the difference; it silently costs ratio at L6+ today.

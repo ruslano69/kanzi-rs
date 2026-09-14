@@ -54,27 +54,34 @@ fn init_probs() -> [[i32; 256]; 4] {
     [[FPAQ_PSCALE as i32 >> 1; 256]; 4]
 }
 
-/// Hot-path body of one encoded bit, operating on locals (port of Go's
-/// encodeBitInlined). Returns updated (low, high, prob).
-#[inline]
-fn encode_bit_inlined(mut low: u64, mut high: u64, bit_is_zero: bool, mut pr: i32) -> (u64, u64, i32) {
-    // Written to maximize accuracy of multiplication/division, like Go.
-    let split = (((high.wrapping_sub(low)) >> 8).wrapping_mul(pr as u64)) >> 8;
+/// One FPAQ bit, fully inlined (port of kanzi-cpp's
+/// `FPAQEncoder::encodeBit`, which mutates `_low`/`_high` in place).
+/// Operates on the `low`/`high` locals; spills them to `self` only on the
+/// rare flush path. Arithmetic is bit-exact with the previous
+/// `encode_bit_inlined` version (wrapping `u64` range ops, `i32` prob
+/// updates with Go-style wrapping).
+macro_rules! encode_bit {
+    ($slf:expr, $low:ident, $high:ident, $ptab:expr, $ctx:expr, $is_zero:expr) => {{
+        let pr = $slf.probs[$ptab][$ctx];
+        let split = (($high.wrapping_sub($low) >> 8).wrapping_mul(pr as u64)) >> 8;
 
-    if bit_is_zero {
-        low = low.wrapping_add(split.wrapping_add(1));
-        pr = pr.wrapping_sub(pr >> 6);
-    } else {
-        high = low.wrapping_add(split);
-        // Wrapping int arithmetic like Go (the decrement can be negative).
-        let dec = pr
-            .wrapping_sub(FPAQ_PSCALE as i32)
-            .wrapping_add(64)
-            >> 6;
-        pr = pr.wrapping_sub(dec);
-    }
+        if $is_zero {
+            $low = $low.wrapping_add(split.wrapping_add(1));
+            $slf.probs[$ptab][$ctx] = pr.wrapping_sub(pr >> 6);
+        } else {
+            $high = $low.wrapping_add(split);
+            let dec = pr.wrapping_sub(FPAQ_PSCALE as i32).wrapping_add(64) >> 6;
+            $slf.probs[$ptab][$ctx] = pr.wrapping_sub(dec);
+        }
 
-    (low, high, pr)
+        if ($low ^ $high) < (1 << 24) {
+            $slf.low = $low;
+            $slf.high = $high;
+            $slf.flush();
+            $low = $slf.low;
+            $high = $slf.high;
+        }
+    }};
 }
 
 pub struct FpaqEncoder {
@@ -141,39 +148,17 @@ impl FpaqEncoder {
             for &val in buf {
                 let bits = val as u32 + 256;
 
-                // Bit 7 uses context 1 in the current table; bits 6..0 use
-                // the decoded-prefix context (bits>>k). Prob updates write
-                // straight into the table (no held borrows across flush).
-                let pr = self.probs[ptab][1];
-                let (l, h, p) = encode_bit_inlined(low, high, val & 0x80 == 0, pr);
-                low = l;
-                high = h;
-                self.probs[ptab][1] = p;
-
-                if (low ^ high) < (1 << 24) {
-                    self.low = low;
-                    self.high = high;
-                    self.flush();
-                    low = self.low;
-                    high = self.high;
-                }
-
-                for (shift, mask) in [(7u32, 0x40u8), (6, 0x20), (5, 0x10), (4, 0x08), (3, 0x04), (2, 0x02), (1, 0x01)] {
-                    let i1 = (bits >> shift) as usize;
-                    let pr = self.probs[ptab][i1];
-                    let (l, h, p) = encode_bit_inlined(low, high, val & mask == 0, pr);
-                    low = l;
-                    high = h;
-                    self.probs[ptab][i1] = p;
-
-                    if (low ^ high) < (1 << 24) {
-                        self.low = low;
-                        self.high = high;
-                        self.flush();
-                        low = self.low;
-                        high = self.high;
-                    }
-                }
+                // Fully unrolled 8-bit walk, mirroring kanzi-cpp's 8
+                // explicit encodeBit calls: bit 7 uses context 1 in the
+                // current table, bits 6..0 use the decoded-prefix context.
+                encode_bit!(self, low, high, ptab, 1, val & 0x80 == 0);
+                encode_bit!(self, low, high, ptab, (bits >> 7) as usize, val & 0x40 == 0);
+                encode_bit!(self, low, high, ptab, (bits >> 6) as usize, val & 0x20 == 0);
+                encode_bit!(self, low, high, ptab, (bits >> 5) as usize, val & 0x10 == 0);
+                encode_bit!(self, low, high, ptab, (bits >> 4) as usize, val & 0x08 == 0);
+                encode_bit!(self, low, high, ptab, (bits >> 3) as usize, val & 0x04 == 0);
+                encode_bit!(self, low, high, ptab, (bits >> 2) as usize, val & 0x02 == 0);
+                encode_bit!(self, low, high, ptab, (bits >> 1) as usize, val & 0x01 == 0);
 
                 ptab = (val >> 6) as usize;
             }
@@ -203,6 +188,40 @@ impl FpaqEncoder {
         self.disposed = true;
         bw.write_bits(self.low | FPAQ_MASK_0_24, 56);
     }
+}
+
+/// One FPAQ decode bit, fully inlined (port of Go's decodeBitV2). The
+/// context `ctx` flows from one bit to the next within a byte, so the
+/// caller's 8 step invocations stay strictly sequential.
+macro_rules! decode_bit {
+    ($slf:expr, $low:ident, $high:ident, $current:ident, $ptab:expr, $ctx:ident) => {{
+        let pr = $slf.probs[$ptab][$ctx as usize];
+        let split = (($high.wrapping_sub($low) >> 8).wrapping_mul(pr as u64) >> 8)
+            .wrapping_add($low);
+
+        if split >= $current {
+            $high = split;
+            $slf.probs[$ptab][$ctx as usize] = pr.wrapping_sub(
+                pr.wrapping_sub(FPAQ_PSCALE as i32).wrapping_add(64) >> 6,
+            );
+            $ctx = $ctx.wrapping_add($ctx).wrapping_add(1);
+        } else {
+            $low = split.wrapping_add(1);
+            $slf.probs[$ptab][$ctx as usize] = pr.wrapping_sub(pr >> 6);
+            $ctx = $ctx.wrapping_add($ctx);
+        }
+
+        if ($low ^ $high) < (1 << 24) {
+            // Slow path: sync and refill.
+            $slf.low = $low;
+            $slf.high = $high;
+            $slf.current = $current;
+            $slf.read();
+            $low = $slf.low;
+            $high = $slf.high;
+            $current = $slf.current;
+        }
+    }};
 }
 
 pub struct FpaqDecoder {
@@ -292,36 +311,15 @@ impl FpaqDecoder {
             for slot in buf.iter_mut() {
                 let mut ctx = 1u8;
 
-                // Unrolled 8x decodeBitV2.
-                for _ in 0..8 {
-                    let pr = self.probs[ptab][ctx as usize];
-                    let split = ((((high.wrapping_sub(low)) >> 8).wrapping_mul(pr as u64)) >> 8)
-                        .wrapping_add(low);
-
-                    if split >= current {
-                        high = split;
-                        self.probs[ptab][ctx as usize] = pr.wrapping_sub(
-                            (pr.wrapping_sub(FPAQ_PSCALE as i32).wrapping_add(64)) >> 6,
-                        );
-                        ctx = ctx.wrapping_add(ctx).wrapping_add(1);
-                    } else {
-                        low = split.wrapping_add(1);
-                        self.probs[ptab][ctx as usize] =
-                            pr.wrapping_sub(pr >> 6);
-                        ctx = ctx.wrapping_add(ctx);
-                    }
-
-                    if (low ^ high) < (1 << 24) {
-                        // Slow path: sync and refill.
-                        self.low = low;
-                        self.high = high;
-                        self.current = current;
-                        self.read();
-                        low = self.low;
-                        high = self.high;
-                        current = self.current;
-                    }
-                }
+                // Unrolled 8x decodeBitV2 (was `for _ in 0..8`).
+                decode_bit!(self, low, high, current, ptab, ctx);
+                decode_bit!(self, low, high, current, ptab, ctx);
+                decode_bit!(self, low, high, current, ptab, ctx);
+                decode_bit!(self, low, high, current, ptab, ctx);
+                decode_bit!(self, low, high, current, ptab, ctx);
+                decode_bit!(self, low, high, current, ptab, ctx);
+                decode_bit!(self, low, high, current, ptab, ctx);
+                decode_bit!(self, low, high, current, ptab, ctx);
 
                 *slot = ctx;
                 // NOTE: Go also writes this.ctx = ctx (field used only by the
