@@ -558,24 +558,60 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        // decode <input.knz> <output> [reps]
+        //
+        // With `reps` > 1 the decode is repeated in-process and the fastest
+        // run is reported, so the number is comparable with kanzi-cpp's own
+        // "Decompression time" (which likewise excludes process start-up).
+        // Thread count follows KANZI_JOBS, the equivalent of kanzi-cpp's -j.
         "decode" => {
             let data = fs::read(&args[2]).expect("read input");
-            match container::decode(&data) {
-                Ok(out) => {
-                    fs::write(&args[3], &out).expect("write output");
-                    println!("decoded {} -> {} bytes", data.len(), out.len());
-                }
-                Err(e) => {
-                    eprintln!("decode failed: {}", e);
-                    std::process::exit(1);
-                }
+            let reps: usize = args.get(4).map(|s| s.parse().unwrap_or(1)).unwrap_or(1);
+            let mut best = f64::MAX;
+            let mut out = Vec::new();
+
+            for _ in 0..reps.max(1) {
+                let t0 = std::time::Instant::now();
+                out = match container::decode(&data) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        eprintln!("decode failed: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                best = best.min(t0.elapsed().as_secs_f64() * 1000.0);
             }
+
+            write_chunked(&args[3], &out).expect("write output");
+            println!(
+                "decoded {} -> {} bytes in {:.1} ms (best of {})",
+                data.len(),
+                out.len(),
+                best,
+                reps.max(1)
+            );
         }
         other => {
             eprintln!("unknown subcommand: {}", other);
             std::process::exit(1);
         }
     }
+}
+
+/// Writes `data` in 4 MiB pieces. On Windows a single `WriteFile` of a
+/// multi-hundred-MB buffer (what `fs::write` issues) goes 4-5x slower through
+/// the cache manager than the same bytes in block-sized writes: 255-338 ms vs
+/// 57-73 ms for 212 MB on an i3-12100 / NVMe.
+fn write_chunked(path: &str, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut f = fs::File::create(path)?;
+
+    for chunk in data.chunks(4 << 20) {
+        f.write_all(chunk)?;
+    }
+
+    Ok(())
 }
 
 fn text_test(prefix: &str, block_size: u32) {

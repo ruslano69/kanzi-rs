@@ -28,6 +28,23 @@ use crate::utf;
 use crate::xxhash::{XxHash32, XxHash64};
 use crate::zrlt;
 
+/// Number of block worker threads (encode and decode):
+/// `available_parallelism()` capped at `max`, unless `KANZI_JOBS` overrides
+/// it (the equivalent of kanzi-cpp's `-j`). Pinning this to 1 is what lets a
+/// per-block speed comparison be separated from a thread-scaling comparison.
+fn worker_count(max: usize) -> usize {
+    let avail = std::env::var("KANZI_JOBS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        });
+    avail.min(max)
+}
+
 const BITSTREAM_TYPE: u64 = 0x4B414E5A; // "KANZ"
 const BITSTREAM_FORMAT_VERSION: u64 = 7;
 const HASH: u32 = 0x1E35A7BD;
@@ -194,10 +211,7 @@ where
         return Vec::new();
     }
 
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(ranges.len());
+    let workers = worker_count(ranges.len());
     let mut results: Vec<Option<(Vec<u8>, u64)>> = (0..ranges.len()).map(|_| None).collect();
 
     if workers <= 1 {
@@ -2232,6 +2246,7 @@ fn decode_block_payload(br: &mut BitReader, block_header: &BlockHeader, hdr: &St
 
 /// Decodes a complete .knz bitstream (levels 1-6; see module doc).
 pub fn decode(data: &[u8]) -> Result<Vec<u8>, String> {
+    let t_fn = std::time::Instant::now();
     let mut br = BitReader::new(data);
     let hdr = read_stream_header(&mut br)?;
     let debug = std::env::var("KDEBUG").is_ok();
@@ -2276,11 +2291,25 @@ pub fn decode(data: &[u8]) -> Result<Vec<u8>, String> {
     // its bit range is known it can be decoded from an independent
     // `BitReader` anchored at that offset, concurrently with every other
     // block, mirroring the encode side's parallelism.
+    let t_blocks = std::time::Instant::now();
     let decoded = decode_blocks_parallel(data, &spans, &hdr, debug)?;
+    let d_blocks = t_blocks.elapsed();
+
+    let t_join = std::time::Instant::now();
     let mut out = Vec::with_capacity(decoded.iter().map(|b| b.len()).sum());
 
     for block in decoded {
         out.extend_from_slice(&block);
+    }
+
+    if std::env::var("DECTRACE").is_ok() {
+        eprintln!(
+            "DEC total(us): scan={} blocks={} join={} fn={}",
+            (t_blocks - t_fn).as_micros(),
+            d_blocks.as_micros(),
+            t_join.elapsed().as_micros(),
+            t_fn.elapsed().as_micros()
+        );
     }
 
     Ok(out)
@@ -2337,10 +2366,7 @@ fn decode_blocks_parallel(data: &[u8], spans: &[(usize, u64)], hdr: &StreamHeade
         return Ok(Vec::new());
     }
 
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(spans.len());
+    let workers = worker_count(spans.len());
 
     if workers <= 1 {
         return spans
