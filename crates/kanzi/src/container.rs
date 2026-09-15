@@ -1603,10 +1603,12 @@ fn read_block_header(
 
 /// Applies the known inverse-transform chain for one of the five
 /// transform_type combos this project's encoder produces. `buffer` is the
-/// entropy-decoded bytes (the output of the LAST forward transform).
-/// Returns the recovered original block bytes.
+/// entropy-decoded bytes (the output of the LAST forward transform); it is
+/// consumed, and freed as soon as the first inverse stage has read it, so a
+/// block never holds it alongside the later stages' buffers. Returns the
+/// recovered original block bytes.
 fn apply_inverse_transforms(
-    buffer: &[u8],
+    buffer: Vec<u8>,
     transform_type: u64,
     skip_flags: u8,
     block_size: u32,
@@ -1615,7 +1617,7 @@ fn apply_inverse_transforms(
     if transform_type == 0 {
         // Level 0 (store): the one forced slot is NONE_TYPE, a pure
         // identity -- always a no-op regardless of skip_flags.
-        return Ok(buffer.to_vec());
+        return Ok(buffer);
     }
 
     let l1_type: u64 = LZX_TYPE << BFF_MAX_SHIFT;
@@ -1665,21 +1667,23 @@ fn apply_inverse_transforms(
         // slot0 = LZX. skip bit is the top bit of the (8-bit-wide, 1
         // transform) skip_flags byte.
         if skip_flags & 0x80 != 0 {
-            return Ok(buffer.to_vec());
+            return Ok(buffer);
         }
 
         let mut dst = vec![0u8; dst_cap];
-        let (_, n) = LzxCodec::inverse(buffer, &mut dst).map_err(|e| e.to_string())?;
+        let (_, n) = LzxCodec::inverse(&buffer, &mut dst).map_err(|e| e.to_string())?;
+        drop(buffer);
         dst.truncate(n);
         Ok(dst)
     } else if transform_type == l2_type {
         // slot0 = DNA/Alias, slot1 = LZ. Inverse order is the reverse of
         // forward order: LZ first, then DNA/Alias (see alias.rs).
         let stage = if skip_flags & 0x40 != 0 {
-            buffer.to_vec()
+            buffer
         } else {
             let mut dst = vec![0u8; dst_cap];
-            let (_, n) = LzxCodec::inverse(buffer, &mut dst).map_err(|e| e.to_string())?;
+            let (_, n) = LzxCodec::inverse(&buffer, &mut dst).map_err(|e| e.to_string())?;
+            drop(buffer);
             dst.truncate(n);
             dst
         };
@@ -1707,10 +1711,11 @@ fn apply_inverse_transforms(
         let t0 = std::time::Instant::now();
 
         let stage = if skip_lzx {
-            buffer.to_vec()
+            buffer
         } else {
             let mut dst = vec![0u8; dst_cap];
-            let (_, n) = LzxCodec::inverse(buffer, &mut dst).map_err(|e| e.to_string())?;
+            let (_, n) = LzxCodec::inverse(&buffer, &mut dst).map_err(|e| e.to_string())?;
+            drop(buffer);
             dst.truncate(n);
             dst
         };
@@ -1785,11 +1790,12 @@ fn apply_inverse_transforms(
         let skip_text = skip_flags & 0x80 != 0;
 
         let stage = if skip_rolz {
-            buffer.to_vec()
+            buffer
         } else {
             let mut rolz = RolzCodec::new();
             let mut dst = vec![0u8; dst_cap];
-            let (_, n) = rolz.inverse(buffer, &mut dst).map_err(|e| e.to_string())?;
+            let (_, n) = rolz.inverse(&buffer, &mut dst).map_err(|e| e.to_string())?;
+            drop(buffer);
             dst.truncate(n);
             dst
         };
@@ -1853,10 +1859,11 @@ fn apply_inverse_transforms(
         let t0 = std::time::Instant::now();
 
         let stage = if skip_zrlt {
-            buffer.to_vec()
+            buffer
         } else {
             let mut dst = vec![0u8; dst_cap];
-            let (_, n) = zrlt::inverse(buffer, &mut dst).map_err(|e| e.to_string())?;
+            let (_, n) = zrlt::inverse(&buffer, &mut dst).map_err(|e| e.to_string())?;
+            drop(buffer);
             dst.truncate(n);
             dst
         };
@@ -1933,10 +1940,11 @@ fn apply_inverse_transforms(
         let skip_text = skip_flags & 0x80 != 0;
 
         let stage = if skip_zrlt {
-            buffer.to_vec()
+            buffer
         } else {
             let mut dst = vec![0u8; dst_cap];
-            let (_, n) = zrlt::inverse(buffer, &mut dst).map_err(|e| e.to_string())?;
+            let (_, n) = zrlt::inverse(&buffer, &mut dst).map_err(|e| e.to_string())?;
+            drop(buffer);
             dst.truncate(n);
             dst
         };
@@ -1995,11 +2003,12 @@ fn apply_inverse_transforms(
         let t0 = std::time::Instant::now();
 
         let stage = if skip_lzp1 {
-            buffer.to_vec()
+            buffer
         } else {
             let mut lzp1 = LzpCodec::new();
             let mut dst = vec![0u8; dst_cap];
-            let (_, n) = lzp1.inverse(buffer, &mut dst).map_err(|e| e.to_string())?;
+            let (_, n) = lzp1.inverse(&buffer, &mut dst).map_err(|e| e.to_string())?;
+            drop(buffer);
             dst.truncate(n);
             dst
         };
@@ -2077,10 +2086,11 @@ fn apply_inverse_transforms(
         let skip_exe = skip_flags & 0x80 != 0;
 
         let stage = if skip_dna {
-            buffer.to_vec()
+            buffer
         } else {
             let mut dst = vec![0u8; dst_cap];
-            let (_, n) = alias::inverse(buffer, &mut dst).map_err(|e| e.to_string())?;
+            let (_, n) = alias::inverse(&buffer, &mut dst).map_err(|e| e.to_string())?;
+            drop(buffer);
             dst.truncate(n);
             dst
         };
@@ -2182,7 +2192,7 @@ fn decode_block(block: FramedBlock, hdr: &StreamHeader, debug: bool) -> Result<V
         payload
     } else {
         apply_inverse_transforms(
-            &payload,
+            payload,
             hdr.transform_type,
             block_header.skip_flags,
             hdr.block_size,
