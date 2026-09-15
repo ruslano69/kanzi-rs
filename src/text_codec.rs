@@ -928,3 +928,62 @@ pub fn inverse(
 
     Ok((src_idx, dst_idx))
 }
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// Not a correctness test -- wall-clock timing of `inverse` alone, to
+    /// compare against kanzi-cpp's `TextCodec2::inverse` measured by an
+    /// equivalent standalone C++ harness. Both sides run the same forward
+    /// transform first, so they consume byte-identical payloads.
+    ///
+    /// `#[ignore]`d so normal `cargo test` runs stay fast. Run with
+    /// `TC2_BENCH_FILE=<path> cargo test --release bench_inverse_only --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_inverse_only() {
+        let path = match std::env::var("TC2_BENCH_FILE") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("set TC2_BENCH_FILE to run this benchmark");
+                return;
+            }
+        };
+        let reps: usize = std::env::var("TC2_BENCH_REPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15);
+
+        let raw = std::fs::read(&path).expect("read input");
+        let n = raw.len();
+
+        let mut enc = vec![0u8; max_encoded_len(n) + 1024];
+        let (_, enc_len, _) = forward(&raw, &mut enc, n as u32, false).expect("forward");
+        eprintln!("input {n} bytes -> TEXT-encoded {enc_len} bytes");
+
+        let mut dec = vec![0u8; n + 1024];
+        let mut ms = Vec::with_capacity(reps);
+
+        for r in 0..reps {
+            let t0 = std::time::Instant::now();
+            let (_, dst_idx) = inverse(&enc[..enc_len], &mut dec, n as u32, false).expect("inverse");
+            let dt = t0.elapsed().as_secs_f64() * 1000.0;
+
+            assert_eq!(dst_idx, n, "length mismatch");
+            if r == 0 {
+                assert_eq!(&dec[..n], &raw[..], "MISMATCH");
+            }
+            ms.push(dt);
+        }
+
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "rust_tc2_inverse min={:.2}ms median={:.2}ms reps={}",
+            ms[0],
+            ms[ms.len() / 2],
+            reps
+        );
+    }
+}
