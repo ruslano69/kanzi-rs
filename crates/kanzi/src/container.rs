@@ -2131,44 +2131,63 @@ fn apply_inverse_transforms(
     }
 }
 
-fn decode_block(
-    br: &mut BitReader,
-    written: u64,
-    hdr: &StreamHeader,
-    debug: bool,
-) -> Result<Vec<u8>, String> {
-    let block_header = read_block_header(br, written, hdr.transform_type)?;
-    let pre_len = block_header.pre_transform_length as usize;
+/// Decodes one framed block, consuming its compressed bytes: they are freed
+/// as soon as the entropy stage has produced the transform input, so a block
+/// in flight never holds its compressed bytes and its transform buffers at
+/// the same time.
+fn decode_block(block: FramedBlock, hdr: &StreamHeader, debug: bool) -> Result<Vec<u8>, String> {
+    let (block_header, expected_checksum, payload) = {
+        let mut br = BitReader::at_bit_pos(&block.bytes, block.bit_off);
+        let br = &mut br;
+        let block_header = read_block_header(br, block.written, hdr.transform_type)?;
+        let pre_len = block_header.pre_transform_length as usize;
 
-    if debug {
-        eprintln!(
-            "DEBUG   raw_copy={} transformed_copy={} skip_flags={:#010b} pre_transform_length={} header_bits={}",
-            block_header.raw_copy, block_header.transformed_copy, block_header.skip_flags, pre_len, block_header.header_bits
-        );
-    }
+        if debug {
+            eprintln!(
+                "DEBUG   raw_copy={} transformed_copy={} skip_flags={:#010b} pre_transform_length={} header_bits={}",
+                block_header.raw_copy, block_header.transformed_copy, block_header.skip_flags, pre_len, block_header.header_bits
+            );
+        }
 
-    if pre_len == 0 || pre_len as u32 > hdr.block_size + hdr.block_size / 2 + 2048 {
-        return Err(format!("Invalid compressed block size: {}", pre_len));
-    }
+        if pre_len == 0 || pre_len as u32 > hdr.block_size + hdr.block_size / 2 + 2048 {
+            return Err(format!("Invalid compressed block size: {}", pre_len));
+        }
 
-    // The payload checksum (if any) sits right after the block header and
-    // before the payload, in every block shape (raw copy, transformed
-    // copy, and normal entropy-coded) -- see Go's "Extract checksum from
-    // bit stream" step, which runs unconditionally before dispatching on
-    // rawCopy/transformedCopy/normal.
-    let expected_checksum: Option<u64> = match &hdr.hasher {
-        Hasher::None => None,
-        Hasher::H32(_) => Some(br.read_bits(32)),
-        Hasher::H64(_) => Some(br.read_bits(64)),
+        // The payload checksum (if any) sits right after the block header and
+        // before the payload, in every block shape (raw copy, transformed
+        // copy, and normal entropy-coded) -- see Go's "Extract checksum from
+        // bit stream" step, which runs unconditionally before dispatching on
+        // rawCopy/transformedCopy/normal.
+        let expected_checksum: Option<u64> = match &hdr.hasher {
+            Hasher::None => None,
+            Hasher::H32(_) => Some(br.read_bits(32)),
+            Hasher::H64(_) => Some(br.read_bits(64)),
+        };
+
+        let payload = if block_header.raw_copy {
+            // No transform, no entropy: the payload is the final bytes as-is.
+            let mut payload = vec![0u8; pre_len];
+            br.read_array(&mut payload, 8 * pre_len);
+            payload
+        } else {
+            decode_block_entropy(br, &block_header, hdr, pre_len)?
+        };
+
+        (block_header, expected_checksum, payload)
     };
 
+    drop(block);
+
     let decoded = if block_header.raw_copy {
-        // No transform, no entropy: the payload is the final bytes as-is.
-        let mut payload = vec![0u8; pre_len];
-        br.read_array(&mut payload, 8 * pre_len);
         payload
     } else {
-        decode_block_payload(br, &block_header, hdr, pre_len)?
+        apply_inverse_transforms(
+            &payload,
+            hdr.transform_type,
+            block_header.skip_flags,
+            hdr.block_size,
+            hdr.entropy_type == TPAQX_ENTROPY,
+        )?
     };
 
     if let Some(expected) = expected_checksum {
@@ -2189,7 +2208,9 @@ fn decode_block(
     Ok(decoded)
 }
 
-fn decode_block_payload(br: &mut BitReader, block_header: &BlockHeader, hdr: &StreamHeader, pre_len: usize) -> Result<Vec<u8>, String> {
+/// Entropy-decodes a block's payload into the transform input (or copies it
+/// through for a transformed-copy block).
+fn decode_block_entropy(br: &mut BitReader, block_header: &BlockHeader, hdr: &StreamHeader, pre_len: usize) -> Result<Vec<u8>, String> {
     let mut buffer = vec![0u8; pre_len];
 
     let trace = std::env::var("DECTRACE").is_ok();
@@ -2235,13 +2256,7 @@ fn decode_block_payload(br: &mut BitReader, block_header: &BlockHeader, hdr: &St
         eprintln!("DEC entropy(us): type={} t={}", hdr.entropy_type, t_entropy0.elapsed().as_micros());
     }
 
-    apply_inverse_transforms(
-        &buffer,
-        hdr.transform_type,
-        block_header.skip_flags,
-        hdr.block_size,
-        hdr.entropy_type == TPAQX_ENTROPY,
-    )
+    Ok(buffer)
 }
 
 /// Output is written in pieces of at most this size. On Windows a single
@@ -2525,11 +2540,8 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-fn decode_framed_block(block: &FramedBlock, hdr: &StreamHeader, debug: bool) -> Result<Vec<u8>, String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut br = BitReader::at_bit_pos(&block.bytes, block.bit_off);
-        decode_block(&mut br, block.written, hdr, debug)
-    }))
+fn decode_framed_block(block: FramedBlock, hdr: &StreamHeader, debug: bool) -> Result<Vec<u8>, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || decode_block(block, hdr, debug)))
     .unwrap_or_else(|payload| {
         Err(format!("decoder worker thread panicked: {}", panic_message(payload.as_ref())))
     })
@@ -2578,7 +2590,7 @@ fn decode_blocks_ordered<R: std::io::Read>(
 
     if workers <= 1 {
         while let Some(block) = reader.next_block()? {
-            emit(decode_framed_block(&block, hdr, debug)?)?;
+            emit(decode_framed_block(block, hdr, debug)?)?;
         }
 
         return Ok(());
@@ -2592,9 +2604,9 @@ fn decode_blocks_ordered<R: std::io::Read>(
 
     let second = match reader.next_block() {
         Ok(Some(block)) => block,
-        Ok(None) => return emit(decode_framed_block(&first, hdr, debug)?),
+        Ok(None) => return emit(decode_framed_block(first, hdr, debug)?),
         Err(e) => {
-            emit(decode_framed_block(&first, hdr, debug)?)?;
+            emit(decode_framed_block(first, hdr, debug)?)?;
             return Err(e);
         }
     };
@@ -2635,8 +2647,7 @@ fn decode_blocks_ordered<R: std::io::Read>(
                 };
 
                 let Some((i, block)) = job else { break };
-                let res = decode_framed_block(&block, hdr, debug);
-                drop(block);
+                let res = decode_framed_block(block, hdr, debug);
 
                 if tx.send((i, res)).is_err() {
                     break;
