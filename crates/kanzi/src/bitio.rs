@@ -1,6 +1,7 @@
 // MSB-first bit reader/writer matching kanzi-go's bitstream.DefaultInputBitStream
-// / DefaultOutputBitStream semantics. Correctness-first (no bulk/aligned fast
-// paths) since this is the container/header path, not a symbol-decode hot loop.
+// / DefaultOutputBitStream semantics. Bit-level reads and writes stay simple;
+// the bulk array paths (`read_array`/`write_array`) are the throughput-relevant
+// ones, since every block payload and entropy chunk moves through them.
 
 pub struct BitWriter {
     out: Vec<u8>,
@@ -217,12 +218,26 @@ impl<'a> BitReader<'a> {
             i = nbytes;
             remaining -= nbytes * 8;
         } else {
-            // Unaligned: combine each output byte from two adjacent input
-            // bytes. The previous implementation went through `read_bits`
-            // (an internal multi-step loop) per 8 bits, which was far more
-            // work per byte.
+            // Unaligned: each output byte straddles two input bytes. Shift 8
+            // bytes at a time through a big-endian u64, with the following
+            // input byte supplying the low bits, while 9 input bytes remain;
+            // then finish byte by byte, where `byte_at` supplies zeros past
+            // the end. A block's payload starts after a variable-length bit
+            // header, so this path carries every container payload read
+            // (raw/transformed copies, NONE entropy, and the entropy
+            // decoders' own chunk reads); byte-at-a-time it ran ~850 MB/s.
             let bit_off = self.pos & 7;
             let mut byte_idx = self.pos >> 3;
+
+            while remaining >= 64 && byte_idx + 9 <= self.data.len() {
+                let w = u64::from_be_bytes(self.data[byte_idx..byte_idx + 8].try_into().unwrap());
+                let low = self.data[byte_idx + 8] as u64;
+                let v = (w << bit_off) | (low >> (8 - bit_off));
+                dst[i..i + 8].copy_from_slice(&v.to_be_bytes());
+                byte_idx += 8;
+                i += 8;
+                remaining -= 64;
+            }
 
             while remaining >= 8 {
                 let b0 = self.byte_at(byte_idx);
@@ -245,5 +260,53 @@ impl<'a> BitReader<'a> {
         // stream (matching a "successful" read's cursor movement) without
         // writing anywhere.
         self.pos += extra_bits;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `read_array` against the simplest possible reference -- `read_bits`
+    /// one byte at a time -- at every bit offset, for lengths that cross
+    /// the 8-byte fast path's boundaries, run past the end of the data, are
+    /// not whole bytes, or exceed `dst`.
+    #[test]
+    fn read_array_matches_bytewise_read_bits() {
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let data: Vec<u8> = (0..300)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+
+        for start_bit in 0..16 {
+            for count_bits in [0usize, 7, 8, 63, 64, 65, 71, 72, 80, 800, 1601, 2400, 2500] {
+                for dst_len in [count_bits / 8, count_bits.div_ceil(8), 40] {
+                    let mut fast = BitReader::at_bit_pos(&data, start_bit);
+                    let mut got = vec![0xAAu8; dst_len];
+                    fast.read_array(&mut got, count_bits);
+
+                    let mut slow = BitReader::at_bit_pos(&data, start_bit);
+                    let mut want = vec![0xAAu8; dst_len];
+                    let bits = count_bits.min(dst_len * 8);
+
+                    for b in want.iter_mut().take(bits / 8) {
+                        *b = slow.read_bits(8) as u8;
+                    }
+
+                    if bits % 8 != 0 {
+                        want[bits / 8] = (slow.read_bits((bits % 8) as u32) as u8) << (8 - bits % 8);
+                    }
+
+                    let ctx = format!("start_bit={start_bit} count_bits={count_bits} dst_len={dst_len}");
+                    assert_eq!(got, want, "{ctx}");
+                    assert_eq!(fast.bits_read(), start_bit + count_bits, "{ctx}: cursor");
+                }
+            }
+        }
     }
 }
