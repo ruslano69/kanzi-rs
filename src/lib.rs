@@ -42,6 +42,8 @@ mod xxhash;
 mod zrlt;
 
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
+use pyo3::types::PyBytes;
 
 const DEFAULT_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 
@@ -66,32 +68,55 @@ fn default_block_size(level: i32) -> u32 {
 /// `block_size` overrides the level's default block size in bytes (matching
 /// the CLI's `-b`/`--block`); pass `None` to use the same default the
 /// reference kanzi CLI uses for that level.
+///
+/// Takes `PyBackedBytes` rather than `Vec<u8>`: pyo3 fills a `Vec<u8>` from a
+/// `bytes` object through the generic sequence protocol, one Python int per
+/// byte, which cost ~7 ns/byte (~70 ms on a 10 MB input) before any
+/// compression work started.
 #[pyfunction]
 #[pyo3(signature = (data, level, block_size=None))]
-fn compress(data: Vec<u8>, level: i32, block_size: Option<u32>) -> PyResult<Vec<u8>> {
+fn compress<'py>(
+    py: Python<'py>,
+    data: PyBackedBytes,
+    level: i32,
+    block_size: Option<u32>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let out = py.detach(|| compress_bytes(&data, level, block_size))?;
+    Ok(PyBytes::new(py, &out))
+}
+
+fn compress_bytes(data: &[u8], level: i32, block_size: Option<u32>) -> PyResult<Vec<u8>> {
     let block_size = block_size.unwrap_or_else(|| default_block_size(level));
     let out = match level {
-        0 => crate::container::encode_level0(&data, block_size, 0),
-        1 => crate::container::encode_level1(&data, block_size, 0),
-        2 => crate::container::encode_level2(&data, block_size, 0),
-        3 => crate::container::encode_level3(&data, block_size, 0),
-        4 => crate::container::encode_level4(&data, block_size, 0),
-        5 => crate::container::encode_level5(&data, block_size, 0),
-        6 => crate::container::encode_level6(&data, block_size, 0),
-        7 => crate::container::encode_level7(&data, block_size, 0),
-        8 => crate::container::encode_level8(&data, block_size, 0),
-        9 => crate::container::encode_level9(&data, block_size, 0),
+        0 => crate::container::encode_level0(data, block_size, 0),
+        1 => crate::container::encode_level1(data, block_size, 0),
+        2 => crate::container::encode_level2(data, block_size, 0),
+        3 => crate::container::encode_level3(data, block_size, 0),
+        4 => crate::container::encode_level4(data, block_size, 0),
+        5 => crate::container::encode_level5(data, block_size, 0),
+        6 => crate::container::encode_level6(data, block_size, 0),
+        7 => crate::container::encode_level7(data, block_size, 0),
+        8 => crate::container::encode_level8(data, block_size, 0),
+        9 => crate::container::encode_level9(data, block_size, 0),
         _ => return Err(pyo3::exceptions::PyValueError::new_err("level must be 0‑9")),
     };
     Ok(out)
 }
 
 /// Decompress a Kanzi container (produced by `compress`) and return the original data.
+///
+/// `PyBackedBytes` borrows the caller's `bytes` object instead of copying it
+/// into a fresh `Vec` (see `compress` for why that copy was so expensive),
+/// and `detach` releases the GIL for the decode itself so other Python
+/// threads keep running.
 #[pyfunction]
-fn decompress(data: Vec<u8>) -> PyResult<Vec<u8>> {
-    crate::container::decode(&data).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("decode error: {}", e))
-    })
+fn decompress<'py>(py: Python<'py>, data: PyBackedBytes) -> PyResult<Bound<'py, PyBytes>> {
+    let out = py
+        .detach(|| crate::container::decode(&data))
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("decode error: {}", e))
+        })?;
+    Ok(PyBytes::new(py, &out))
 }
 
 /// Convenience: compress a file and write the .kanzi container to a new file.
@@ -100,7 +125,7 @@ fn compress_to_file(path: &str, level: i32) -> PyResult<()> {
     let data = std::fs::read(path).map_err(|e| {
         pyo3::exceptions::PyIOError::new_err(format!("failed to read {}: {}", path, e))
     })?;
-    let compressed = compress(data.clone(), level, None)?;
+    let compressed = compress_bytes(&data, level, None)?;
     let out_path = format!("{}.kanzi", path);
     std::fs::write(&out_path, &compressed).map_err(|e| {
         pyo3::exceptions::PyIOError::new_err(format!("failed to write {}: {}", out_path, e))
@@ -114,7 +139,9 @@ fn decompress_to_file(path: &str) -> PyResult<()> {
     let data = std::fs::read(path).map_err(|e| {
         pyo3::exceptions::PyIOError::new_err(format!("failed to read {}: {}", path, e))
     })?;
-    let decoded = decompress(data)?;
+    let decoded = crate::container::decode(&data).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("decode error: {}", e))
+    })?;
     std::fs::write(path, &decoded).map_err(|e| {
         pyo3::exceptions::PyIOError::new_err(format!("failed to write {}: {}", path, e))
     })?;
