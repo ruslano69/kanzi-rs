@@ -1886,11 +1886,10 @@ fn apply_inverse_transforms(
         let stage = if skip_bwt {
             stage
         } else {
-            let mut bwt = Bwt::new();
-            let mut dst = vec![0u8; dst_cap];
-            let (_, n) = bwt.inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
-            dst.truncate(n);
-            dst
+            // In place: BWT's inverse needs no separate output buffer.
+            let mut stage = stage;
+            Bwt::new().inverse_in_place(&mut stage).map_err(|e| e.to_string())?;
+            stage
         };
         let t_bwt = t2.elapsed();
 
@@ -1963,11 +1962,10 @@ fn apply_inverse_transforms(
         let stage = if skip_bwt {
             stage
         } else {
-            let mut bwt = Bwt::new();
-            let mut dst = vec![0u8; dst_cap];
-            let (_, n) = bwt.inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
-            dst.truncate(n);
-            dst
+            // In place: BWT's inverse needs no separate output buffer.
+            let mut stage = stage;
+            Bwt::new().inverse_in_place(&mut stage).map_err(|e| e.to_string())?;
+            stage
         };
 
         let stage = if skip_utf {
@@ -2018,11 +2016,10 @@ fn apply_inverse_transforms(
         let stage = if skip_bwt {
             stage
         } else {
-            let mut bwt = Bwt::new();
-            let mut dst = vec![0u8; dst_cap];
-            let (_, n) = bwt.inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
-            dst.truncate(n);
-            dst
+            // In place: BWT's inverse needs no separate output buffer.
+            let mut stage = stage;
+            Bwt::new().inverse_in_place(&mut stage).map_err(|e| e.to_string())?;
+            stage
         };
         let t_bwt = t1.elapsed();
 
