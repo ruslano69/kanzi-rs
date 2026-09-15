@@ -1,32 +1,10 @@
 [workspace]
-
-[package]
-name = "rust_kanzi"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-name = "kanzi"          # Python module will be called `kanzi`
-crate-type = ["cdylib"]
+members = ["crates/kanzi", "crates/kanzi-cli", "crates/kanzi-py"]
+# Plain `cargo build` / `cargo test` stay pure Rust: no Python interpreter,
+# no pyo3. The extension module is built by maturin (see pyproject.toml),
+# or explicitly with `cargo build -p kanzi-py`.
+default-members = ["crates/kanzi", "crates/kanzi-cli"]
+resolver = "2"
 
 [profile.release]
 opt-level = 3
-
-[dependencies]
-libsais = { version = "0.2", default-features = false, optional = true }
-pyo3 = { version = "0.26", features = ["extension-module"] }
-
-[features]
-# fast-sa (libsais for BWT's suffix array construction) is on by default:
-# it produces byte-identical output to the in-tree divsufsort.rs (see
-# BENCHMARKS.md) and is ~2x faster still, which is 38-41% faster overall at
-# levels 5-7 where BWT dominates encode time. Needs a C compiler at build
-# time (present by default on GitHub-hosted Linux/Windows/macOS runners and
-# most dev machines); opt out with --no-default-features if you don't have
-# one -- the pure-Rust divsufsort.rs (a port of kanzi-cpp's DivSufSort)
-# remains fully supported and is itself 1.5-2.7x faster than this crate's
-# original pure-Rust SA-IS backend (sais.rs, now kept only as a test
-# oracle), so going without a C toolchain is far less of a speed cliff than
-# it used to be.
-default = ["fast-sa"]
-fast-sa = ["dep:libsais"]

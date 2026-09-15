@@ -2523,7 +2523,7 @@ mod tests {
     #[test]
     fn roundtrip_readme() {
         // This project's own README as a real, non-synthetic text sample.
-        assert_roundtrips_all_levels(include_bytes!("../README.md"));
+        assert_roundtrips_all_levels(include_bytes!("../../../README.md"));
     }
 
     #[test]
@@ -2533,7 +2533,7 @@ mod tests {
         // ("range end index N out of range for slice of length N-1") when
         // the last match in a block left fewer than 4 bytes after m_idx.
         // Found via examples/benchmark.py on this exact file at level 3.
-        assert_roundtrips_all_levels(include_bytes!("../README.md"));
+        assert_roundtrips_all_levels(include_bytes!("../../../README.md"));
     }
 
     #[test]

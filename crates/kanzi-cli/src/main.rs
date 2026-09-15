@@ -1,56 +1,17 @@
-mod alias;
-mod ans;
-mod binary_entropy;
-mod bitio;
-mod bwt;
-mod cm;
-mod container;
-mod datatype;
-#[cfg_attr(not(test), allow(dead_code))]
-mod divsufsort;
-mod exe;
-mod fpaq;
-mod fsd;
-mod huffman_dec;
-mod huffman_enc;
-mod logtables;
-mod lzp;
-mod lzx;
-mod magic;
-mod rlt;
-mod rolz;
-#[cfg_attr(not(test), allow(dead_code))]
-mod sais;
-mod sbrt;
-mod srt;
-mod text_codec;
-mod text_codec1;
-mod tpaq;
-mod utf;
-mod xxhash;
-mod zrlt;
+//! `rust_kanzi`: encode/decode .knz files with the `kanzi` crate, plus the
+//! cross-check subcommands used to verify bitstream parity against kanzi-go
+//! and kanzi-cpp fixtures.
 
-use bitio::BitWriter;
-use huffman_dec::HuffmanDecoderV6;
-use huffman_enc::HuffmanEncoder;
-use lzx::LzxCodec;
+use kanzi::bitio::BitWriter;
+use kanzi::huffman_dec::HuffmanDecoderV6;
+use kanzi::huffman_enc::HuffmanEncoder;
+use kanzi::lzx::LzxCodec;
+use kanzi::{
+    alias, ans, binary_entropy, bitio, bwt, container, datatype, default_block_size, exe, fpaq, fsd, lzx, rlt,
+    rolz, sais, sbrt, srt, text_codec, text_codec1, tpaq, utf, xxhash, zrlt,
+};
 use std::env;
 use std::fs;
-
-/// Per-level default block size, mirroring `lib.rs::default_block_size`
-/// (and kanzi-go's `BlockCompressor` exactly): levels 0-5 use 4 MiB,
-/// level 6 uses 8 MiB, levels 7-8 use 16 MiB, level 9 uses 32 MiB, so the
-/// adaptive entropy models get more data per block before reset.
-fn default_block_size(level: u32) -> u32 {
-    const BASE: u32 = 4 * 1024 * 1024;
-
-    match level {
-        6 => 2 * BASE,
-        7 | 8 => 4 * BASE,
-        9 => 8 * BASE,
-        _ => BASE,
-    }
-}
 
 fn main() {
     let args: Vec<String> = env::args().collect();

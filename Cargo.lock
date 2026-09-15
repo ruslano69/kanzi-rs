@@ -52,6 +52,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "kanzi"
+version = "0.1.0"
+dependencies = [
+ "libsais",
+]
+
+[[package]]
+name = "kanzi-cli"
+version = "0.1.0"
+dependencies = [
+ "kanzi",
+]
+
+[[package]]
+name = "kanzi-py"
+version = "0.1.0"
+dependencies = [
+ "kanzi",
+ "pyo3",
+ "pyo3-build-config",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -185,14 +208,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
-]
-
-[[package]]
-name = "rust_kanzi"
-version = "0.1.0"
-dependencies = [
- "libsais",
- "pyo3",
 ]
 
 [[package]]

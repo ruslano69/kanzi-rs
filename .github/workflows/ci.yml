@@ -11,7 +11,7 @@ env:
 
 jobs:
   rust:
-    name: cargo build/test (${{ matrix.os }})
+    name: cargo build/test, pure Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -30,12 +30,12 @@ jobs:
       - name: cargo test
         run: cargo test --release --verbose
 
-      # libsais links a small C library; ubuntu-latest has a C toolchain
-      # preinstalled, so this is enough to catch a regression in the
-      # optional feature without needing it in the full OS matrix.
-      - name: cargo build (fast-sa feature)
+      # fast-sa (libsais) is a default feature, so the steps above already
+      # cover it on every OS; this keeps the pure-Rust suffix array path
+      # (divsufsort.rs, used with --no-default-features) building and tested.
+      - name: cargo test (pure-Rust suffix array, no fast-sa)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo build --release --features fast-sa --verbose
+        run: cargo test --release -p kanzi --no-default-features --verbose
 
   wheels:
     name: wheel + round-trip (${{ matrix.os }}, py${{ matrix.python-version }})
@@ -64,7 +64,7 @@ jobs:
         run: pip install --force-reinstall dist/*.whl
 
       - name: Round-trip regression check (all levels, real files, --strict)
-        run: python examples/benchmark.py --strict
+        run: python crates/kanzi-py/examples/benchmark.py --strict
 
       - uses: actions/upload-artifact@v4
         with:

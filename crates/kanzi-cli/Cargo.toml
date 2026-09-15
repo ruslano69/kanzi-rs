@@ -1,0 +1,18 @@
+[package]
+name = "kanzi-cli"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Command-line tool for the kanzi crate: encode/decode plus cross-check subcommands against kanzi-go/kanzi-cpp"
+repository = "https://github.com/ruslano69/kanzi-rs"
+
+[[bin]]
+name = "rust_kanzi"
+path = "src/main.rs"
+
+[dependencies]
+kanzi = { path = "../kanzi", default-features = false }
+
+[features]
+default = ["fast-sa"]
+fast-sa = ["kanzi/fast-sa"]
