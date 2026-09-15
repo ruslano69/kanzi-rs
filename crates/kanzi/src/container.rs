@@ -2244,75 +2244,272 @@ fn decode_block_payload(br: &mut BitReader, block_header: &BlockHeader, hdr: &St
     )
 }
 
-/// Decodes a complete .knz bitstream (levels 1-6; see module doc).
+/// Output is written in pieces of at most this size. On Windows a single
+/// `WriteFile` of a multi-hundred-MB buffer goes 4-5x slower through the
+/// cache manager than the same bytes in block-sized writes (255-338 ms vs
+/// 57-73 ms for 212 MB on an i3-12100 / NVMe), and a block can be up to
+/// 1 GiB with an explicit block size.
+const WRITE_CHUNK: usize = 4 << 20;
+
+/// Decodes a complete .knz bitstream held in memory. Prefer [`decode_to`]
+/// when the input is a file or the output goes to one: it never holds more
+/// than a few blocks at once.
 pub fn decode(data: &[u8]) -> Result<Vec<u8>, String> {
-    let t_fn = std::time::Instant::now();
-    let mut br = BitReader::new(data);
-    let hdr = read_stream_header(&mut br)?;
-    let debug = std::env::var("KDEBUG").is_ok();
+    let mut blocks: Vec<Vec<u8>> = Vec::new();
 
-    // Phase 1: a cheap sequential pass that only *locates* each block --
-    // its bit position right after the length prefix, and its bit length
-    // -- without decoding any of its content. `skip_bits` is O(1), so this
-    // whole pass costs O(block count), not O(total bits), regardless of
-    // how large the blocks themselves are.
-    let mut spans: Vec<(usize, u64)> = Vec::new();
-    let mut block_id = 0;
+    decode_with(data, None, |block| {
+        blocks.push(block);
+        Ok(())
+    })?;
 
-    loop {
-        let offset = br.bits_read();
-        let lw = (br.read_bits(5) as u32) + 3;
-        let written = br.read_bits(lw);
-
-        if written == 0 {
-            break;
-        }
-
-        block_id += 1;
-
-        if debug {
-            eprintln!(
-                "DEBUG block {} offset={} lw={} written={} written_bytes={}",
-                block_id,
-                offset,
-                lw,
-                written,
-                (written + 7) >> 3
-            );
-        }
-
-        spans.push((br.bits_read(), written));
-        br.skip_bits(written as usize);
+    if blocks.len() == 1 {
+        return Ok(blocks.pop().unwrap());
     }
 
-    // Phase 2: every block is a fully self-contained framed unit -- its
-    // own header, checksum and entropy state, freshly (re)initialized on
-    // decode (see encode_blocks_parallel's doc comment for why) -- so once
-    // its bit range is known it can be decoded from an independent
-    // `BitReader` anchored at that offset, concurrently with every other
-    // block, mirroring the encode side's parallelism.
-    let t_blocks = std::time::Instant::now();
-    let decoded = decode_blocks_parallel(data, &spans, &hdr, debug)?;
-    let d_blocks = t_blocks.elapsed();
+    let mut out = Vec::with_capacity(blocks.iter().map(|b| b.len()).sum());
 
-    let t_join = std::time::Instant::now();
-    let mut out = Vec::with_capacity(decoded.iter().map(|b| b.len()).sum());
-
-    for block in decoded {
+    for block in blocks {
         out.extend_from_slice(&block);
     }
 
-    if std::env::var("DECTRACE").is_ok() {
+    Ok(out)
+}
+
+/// Decodes a .knz bitstream from `input`, writing the original bytes to
+/// `out` in order as blocks finish, and returns the number of bytes written.
+///
+/// Both sides stream: `input` is read one framed block at a time and blocks
+/// are decoded in parallel, but only a small window of blocks (about two per
+/// worker thread) is buffered at any point, so memory is bounded by the
+/// stream's block size, not by the input or output size. Neither side is
+/// buffered further: input is pulled in pieces of 64 KiB or a whole block,
+/// output is written in pieces of up to 4 MiB, and `out` is not flushed.
+///
+/// On error, the blocks before the failing one have already been written.
+pub fn decode_to<R: std::io::Read, W: std::io::Write>(input: R, out: &mut W) -> Result<u64, String> {
+    let mut total = 0u64;
+
+    decode_with(input, None, |block| {
+        for chunk in block.chunks(WRITE_CHUNK) {
+            out.write_all(chunk).map_err(|e| format!("write error: {}", e))?;
+        }
+
+        total += block.len() as u64;
+        Ok(())
+    })?;
+
+    Ok(total)
+}
+
+/// Shared by [`decode`] and [`decode_to`]: reads the stream header, then
+/// hands each decoded block to `emit` in stream order. `jobs` pins the
+/// worker thread count (tests run the same stream sequentially and in
+/// parallel); `None` means `worker_count`.
+fn decode_with<R: std::io::Read>(
+    input: R,
+    jobs: Option<usize>,
+    mut emit: impl FnMut(Vec<u8>) -> Result<(), String>,
+) -> Result<(), String> {
+    let trace = std::env::var("DECTRACE").is_ok();
+    let t_fn = std::time::Instant::now();
+    let mut reader = BlockReader::new(input, std::env::var("KDEBUG").is_ok());
+    let hdr = reader.read_header()?;
+    let workers = jobs.unwrap_or_else(|| worker_count(usize::MAX)).max(1);
+    let mut d_emit = std::time::Duration::ZERO;
+
+    decode_blocks_ordered(&mut reader, &hdr, workers, |block| {
+        let t = std::time::Instant::now();
+        let r = emit(block);
+        d_emit += t.elapsed();
+        r
+    })?;
+
+    if trace {
         eprintln!(
-            "DEC total(us): scan={} blocks={} join={} fn={}",
-            (t_blocks - t_fn).as_micros(),
-            d_blocks.as_micros(),
-            t_join.elapsed().as_micros(),
+            "DEC total(us): read={} emit={} fn={}",
+            reader.read_time.as_micros(),
+            d_emit.as_micros(),
             t_fn.elapsed().as_micros()
         );
     }
 
-    Ok(out)
+    Ok(())
+}
+
+/// One framed block as read off the stream: its bytes, and where its bits
+/// start and how many there are. The first byte may carry trailing bits of
+/// the previous block's length prefix, hence `bit_off`.
+struct FramedBlock {
+    bytes: Vec<u8>,
+    bit_off: usize,
+    written: u64,
+}
+
+/// Pulls the stream header and then one framed block at a time out of a
+/// `Read`. Between blocks it holds only read-ahead for the next length
+/// prefix (at most 64 KiB); a block body is read straight into that block's
+/// own buffer.
+///
+/// Every block is a fully self-contained framed unit -- its own header,
+/// checksum and entropy state, freshly (re)initialized on decode (see
+/// encode_blocks_parallel's doc comment for why) -- so its bytes can be
+/// decoded independently of every other block, on any thread.
+struct BlockReader<R> {
+    input: R,
+    /// Read-ahead not yet consumed; `pos` is a bit offset into it.
+    buf: Vec<u8>,
+    pos: usize,
+    /// Stream bit offset of `buf[0]`, for `KDEBUG` output.
+    base_bits: u64,
+    eof: bool,
+    /// Largest acceptable framed block, from the stream header's block size.
+    max_block_bytes: u64,
+    blocks_read: usize,
+    debug: bool,
+    read_time: std::time::Duration,
+}
+
+impl<R: std::io::Read> BlockReader<R> {
+    const READ_AHEAD: usize = 64 * 1024;
+
+    fn new(input: R, debug: bool) -> Self {
+        BlockReader {
+            input,
+            buf: Vec::new(),
+            pos: 0,
+            base_bits: 0,
+            eof: false,
+            max_block_bytes: 0,
+            blocks_read: 0,
+            debug,
+            read_time: std::time::Duration::ZERO,
+        }
+    }
+
+    /// Reads until `buf` holds at least `bytes` bytes or the input ends.
+    fn fill_to(&mut self, bytes: usize) -> Result<(), String> {
+        while self.buf.len() < bytes && !self.eof {
+            let old = self.buf.len();
+            self.buf.resize(old + (bytes - old).max(Self::READ_AHEAD), 0);
+
+            match self.input.read(&mut self.buf[old..]) {
+                Ok(0) => {
+                    self.buf.truncate(old);
+                    self.eof = true;
+                }
+                Ok(n) => self.buf.truncate(old + n),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => self.buf.truncate(old),
+                Err(e) => {
+                    self.buf.truncate(old);
+                    return Err(format!("read error: {}", e));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn read_header(&mut self) -> Result<StreamHeader, String> {
+        // The header is at most 208 bits; a shorter input reads as zeros
+        // and fails the magic or header checksum check.
+        self.fill_to(64)?;
+        let mut br = BitReader::new(&self.buf);
+        let hdr = read_stream_header(&mut br)?;
+        self.pos = br.bits_read();
+
+        // Same bound as kanzi-cpp's CompressedInputStream: a block's
+        // pre-transform length is at most blockSize + blockSize/2 + 2048
+        // (checked again in decode_block), plus its header and checksum.
+        // Rejecting larger length prefixes up front keeps a corrupt or
+        // hostile prefix from forcing a huge allocation.
+        let bs = hdr.block_size as u64;
+        self.max_block_bytes = bs + bs / 2 + 2048 + 64;
+
+        Ok(hdr)
+    }
+
+    /// Reads the next framed block, or `None` at the end-of-stream marker.
+    fn next_block(&mut self) -> Result<Option<FramedBlock>, String> {
+        let t = std::time::Instant::now();
+        let r = self.next_block_inner();
+        self.read_time += t.elapsed();
+        r
+    }
+
+    fn next_block_inner(&mut self) -> Result<Option<FramedBlock>, String> {
+        use std::io::Read;
+
+        // Length prefix: 5 bits of width, then 3..=34 bits of block length.
+        let offset = self.base_bits + self.pos as u64;
+        self.fill_to((self.pos + 39).div_ceil(8))?;
+        let mut br = BitReader::at_bit_pos(&self.buf, self.pos);
+        let lw = (br.read_bits(5) as u32) + 3;
+        let written = br.read_bits(lw);
+        let prefix_end = br.bits_read();
+
+        if prefix_end > self.buf.len() * 8 {
+            return Err("Truncated bitstream: missing block length or end-of-stream marker".to_string());
+        }
+
+        self.pos = prefix_end;
+
+        if written == 0 {
+            return Ok(None);
+        }
+
+        self.blocks_read += 1;
+
+        if self.debug {
+            eprintln!(
+                "DEBUG block {} offset={} lw={} written={} written_bytes={}",
+                self.blocks_read,
+                offset,
+                lw,
+                written,
+                written.div_ceil(8)
+            );
+        }
+
+        if written.div_ceil(8) > self.max_block_bytes {
+            return Err(format!("Invalid block size: {} bits", written));
+        }
+
+        let start = self.pos / 8;
+        let bit_off = self.pos % 8;
+        let end_bits = self.pos as u64 + written;
+        let total = end_bits.div_ceil(8) as usize - start;
+        let next_byte = (end_bits / 8) as usize;
+        let buffered_end = self.buf.len().min(start + total);
+
+        let mut bytes = Vec::with_capacity(total.min(64 << 20));
+        bytes.extend_from_slice(&self.buf[start..buffered_end]);
+
+        if bytes.len() < total {
+            // The body runs past the read-ahead: read the rest straight into
+            // this block's buffer. Everything buffered has now been consumed,
+            // except the block's last byte if the next length prefix starts
+            // inside it.
+            let missing = (total - bytes.len()) as u64;
+            (&mut self.input)
+                .take(missing)
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("read error: {}", e))?;
+
+            if bytes.len() < total {
+                return Err(format!("Truncated bitstream: block {} is incomplete", self.blocks_read));
+            }
+
+            self.buf.clear();
+            self.buf.extend_from_slice(&bytes[next_byte - start..]);
+        } else {
+            self.buf.drain(..next_byte);
+        }
+
+        self.base_bits += next_byte as u64 * 8;
+        self.pos = (end_bits % 8) as usize;
+
+        Ok(Some(FramedBlock { bytes, bit_off, written }))
+    }
 }
 
 /// Extracts a human-readable message from a caught panic payload (the
@@ -2328,113 +2525,189 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Decodes every block named in `spans` (each `(start_bit_pos,
-/// written_bits)`, as located by `decode`'s first pass) across up to
-/// `available_parallelism()` threads, returning them in original order.
-///
-/// Work-stealing, not a static contiguous split: every worker repeatedly
-/// claims the next unclaimed span index off one shared `AtomicUsize`
-/// cursor (`fetch_add` hands out a distinct index to each claimer, so no
-/// two workers ever process the same span) instead of being handed a
-/// fixed `[start, end)` range up front. Blocks vary in decode cost --
-/// content-dependent (BWT/entropy work scales with how compressible the
-/// data is, not just its byte length) and structurally (a trailing
-/// partial block is smaller by construction) -- so a static split can
-/// leave some workers idle while one is still grinding through an
-/// expensive block; work-stealing keeps every worker busy until the last
-/// span is claimed. See `BENCHMARKS.md`'s "decode thread pool" section
-/// for the measurement this replaced the static split on the strength of.
-///
-/// This project's decoders are already extensively hardened against
-/// panicking on corrupted input (see the BWT/ANS/TPAQ robustness audit),
-/// but every decoder here ultimately runs on untrusted bytes, so as a
-/// last line of defense any panic inside a worker thread is caught via
-/// `join()` (which a scoped-thread panic never propagates past on its
-/// own) and turned into the same kind of `Err` a clean validation failure
-/// would produce, rather than letting it take down the whole process --
-/// a `catch_unwind`-equivalent safety net that this parallel split gives
-/// us for free. Unlike the old static split, a panicking worker's
-/// in-flight claim isn't attributable to a known `[start, end)` range
-/// anymore, so instead every `results` slot still `None` after all
-/// workers have joined (whether it was mid-flight in the panicking
-/// worker or simply never reached) is backfilled with that panic's
-/// message -- `fetch_add`'s per-index uniqueness guarantees no slot is
-/// ever left `None` when no panic occurred, so this backfill only ever
-/// triggers in the panic case.
-fn decode_blocks_parallel(data: &[u8], spans: &[(usize, u64)], hdr: &StreamHeader, debug: bool) -> Result<Vec<Vec<u8>>, String> {
-    if spans.is_empty() {
-        return Ok(Vec::new());
-    }
+fn decode_framed_block(block: &FramedBlock, hdr: &StreamHeader, debug: bool) -> Result<Vec<u8>, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut br = BitReader::at_bit_pos(&block.bytes, block.bit_off);
+        decode_block(&mut br, block.written, hdr, debug)
+    }))
+    .unwrap_or_else(|payload| {
+        Err(format!("decoder worker thread panicked: {}", panic_message(payload.as_ref())))
+    })
+}
 
-    let workers = worker_count(spans.len());
+/// Work queue shared between the reading/emitting thread and block workers.
+struct BlockQueue {
+    jobs: std::collections::VecDeque<(usize, FramedBlock)>,
+    /// No more jobs will be pushed; workers exit once the queue is empty.
+    closed: bool,
+    /// Give up now: workers exit without taking further jobs.
+    stop: bool,
+}
+
+/// Reads blocks from `reader`, decodes them on `workers` threads, and passes
+/// the results to `emit` strictly in stream order. Reading and emitting
+/// happen on the calling thread; workers only decode.
+///
+/// Workers take blocks from a shared queue rather than a fixed split: block
+/// decode cost is content-dependent (BWT/entropy work scales with how
+/// compressible the data is, and a trailing partial block is smaller), so a
+/// static split leaves workers idle behind one expensive block. A block is
+/// only read once it is within `2 * workers` of the next one to emit, which
+/// bounds queued, in-flight and decoded-but-unemitted blocks together --
+/// this is what keeps [`decode_to`]'s memory independent of stream size.
+///
+/// Errors come out in stream order: once block `i` fails (to read or to
+/// decode), nothing past `i` is read or decoded, earlier blocks still finish
+/// and are emitted, and the error of the lowest failing index is returned.
+///
+/// Every decoder here runs on untrusted bytes and is hardened against
+/// panicking on corrupt input, but as a last line of defense a panic inside
+/// a block decode is caught and turned into that block's `Err` -- which also
+/// guarantees every queued block produces a result, so the emitting thread
+/// never waits on one whose worker died.
+fn decode_blocks_ordered<R: std::io::Read>(
+    reader: &mut BlockReader<R>,
+    hdr: &StreamHeader,
+    workers: usize,
+    mut emit: impl FnMut(Vec<u8>) -> Result<(), String>,
+) -> Result<(), String> {
+    use std::collections::BTreeMap;
+    use std::sync::{mpsc, Condvar, Mutex};
+
+    let debug = reader.debug;
 
     if workers <= 1 {
-        return spans
-            .iter()
-            .map(|&(pos, written)| {
-                let mut local = BitReader::at_bit_pos(data, pos);
-                decode_block(&mut local, written, hdr, debug)
-            })
-            .collect();
+        while let Some(block) = reader.next_block()? {
+            emit(decode_framed_block(&block, hdr, debug)?)?;
+        }
+
+        return Ok(());
     }
 
-    let mut results: Vec<Option<Result<Vec<u8>, String>>> = (0..spans.len()).map(|_| None).collect();
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut panic_msg: Option<String> = None;
+    // Don't start threads for a single-block stream (the common case for
+    // small in-memory inputs).
+    let Some(first) = reader.next_block()? else {
+        return Ok(());
+    };
+
+    let second = match reader.next_block() {
+        Ok(Some(block)) => block,
+        Ok(None) => return emit(decode_framed_block(&first, hdr, debug)?),
+        Err(e) => {
+            emit(decode_framed_block(&first, hdr, debug)?)?;
+            return Err(e);
+        }
+    };
+
+    let window = 2 * workers;
+    let queue = Mutex::new(BlockQueue {
+        jobs: std::collections::VecDeque::from([(0, first), (1, second)]),
+        closed: false,
+        stop: false,
+    });
+    let ready = Condvar::new();
+    let (tx, rx) = mpsc::channel::<(usize, Result<Vec<u8>, String>)>();
 
     std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(workers);
-
         for _ in 0..workers {
-            let next_ref = &next;
+            let tx = tx.clone();
+            let (queue, ready) = (&queue, &ready);
 
-            handles.push(scope.spawn(move || {
-                let mut local = Vec::new();
+            scope.spawn(move || loop {
+                let job = {
+                    let mut q = queue.lock().unwrap();
 
-                loop {
-                    let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    loop {
+                        if q.stop {
+                            break None;
+                        }
 
-                    if i >= spans.len() {
-                        break;
+                        if let Some(job) = q.jobs.pop_front() {
+                            break Some(job);
+                        }
+
+                        if q.closed {
+                            break None;
+                        }
+
+                        q = ready.wait(q).unwrap();
                     }
+                };
 
-                    let (pos, written) = spans[i];
-                    let mut br = BitReader::at_bit_pos(data, pos);
-                    local.push((i, decode_block(&mut br, written, hdr, debug)));
+                let Some((i, block)) = job else { break };
+                let res = decode_framed_block(&block, hdr, debug);
+                drop(block);
+
+                if tx.send((i, res)).is_err() {
+                    break;
                 }
-
-                local
-            }));
+            });
         }
 
-        for handle in handles {
-            match handle.join() {
-                Ok(items) => {
-                    for (i, res) in items {
-                        results[i] = Some(res);
+        drop(tx);
+        ready.notify_all();
+
+        let mut pending: BTreeMap<usize, Result<Vec<u8>, String>> = BTreeMap::new();
+        let mut next_index = 2;
+        let mut emitted = 0;
+        let mut fail_at = usize::MAX;
+        let mut end_reached = false;
+
+        let result = loop {
+            while !end_reached && next_index < fail_at && next_index < emitted + window {
+                match reader.next_block() {
+                    Ok(Some(block)) => {
+                        queue.lock().unwrap().jobs.push_back((next_index, block));
+                        ready.notify_one();
+                    }
+                    Ok(None) => end_reached = true,
+                    Err(e) => {
+                        pending.insert(next_index, Err(e));
+                        fail_at = next_index;
+                        end_reached = true;
                     }
                 }
-                Err(payload) => {
-                    if panic_msg.is_none() {
-                        panic_msg = Some(panic_message(payload.as_ref()));
-                    }
+
+                if !end_reached || fail_at == next_index {
+                    next_index += 1;
                 }
             }
-        }
-    });
 
-    if let Some(msg) = &panic_msg {
-        for r in results.iter_mut() {
-            if r.is_none() {
-                *r = Some(Err(format!("decoder worker thread panicked: {}", msg)));
+            if end_reached {
+                queue.lock().unwrap().closed = true;
+                ready.notify_all();
             }
-        }
-    }
 
-    results
-        .into_iter()
-        .map(|r| r.expect("every block span was claimed exactly once or backfilled after a panic"))
-        .collect()
+            if let Some(res) = pending.remove(&emitted) {
+                match res.and_then(&mut emit) {
+                    Ok(()) => {
+                        emitted += 1;
+                        continue;
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+
+            if end_reached && emitted == next_index {
+                break Ok(());
+            }
+
+            let Ok((i, res)) = rx.recv() else {
+                break Err("decoder workers stopped before every block was decoded".to_string());
+            };
+
+            if res.is_err() && i < fail_at {
+                fail_at = i;
+                queue.lock().unwrap().jobs.retain(|(j, _)| *j < i);
+            }
+
+            pending.insert(i, res);
+        };
+
+        queue.lock().unwrap().stop = true;
+        ready.notify_all();
+        result
+    })
 }
 
 /// Encodes one block's local (byte-aligned) buffer:
@@ -2588,5 +2861,228 @@ mod tests {
         }
 
         assert_roundtrips_all_levels(text.as_bytes());
+    }
+
+    /// Hands out at most `chunk` bytes per `read`, so block bodies and
+    /// length prefixes straddle read boundaries at arbitrary bit offsets.
+    struct ChunkedReader<'a> {
+        data: &'a [u8],
+        chunk: usize,
+    }
+
+    impl std::io::Read for ChunkedReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.chunk.min(buf.len()).min(self.data.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    /// Text-like content that compresses, so blocks vary in encoded size.
+    fn text_like(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        let words: [&[u8]; 8] = [b"alpha ", b"beta ", b"gamma ", b"delta\n", b"kanzi ", b"block ", b"stream ", b"42 "];
+        let mut data = Vec::with_capacity(len + 8);
+
+        while data.len() < len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            data.extend_from_slice(words[(state % 8) as usize]);
+        }
+
+        data.truncate(len);
+        data
+    }
+
+    /// Runs the streaming decoder with a pinned thread count, returning
+    /// everything emitted and the final result.
+    fn decode_streaming(input: impl std::io::Read, jobs: usize) -> (Vec<u8>, Result<(), String>) {
+        let mut out = Vec::new();
+        let res = decode_with(input, Some(jobs), |block| {
+            out.extend_from_slice(&block);
+            Ok(())
+        });
+        (out, res)
+    }
+
+    #[test]
+    fn streaming_decode_many_blocks_any_jobs_any_read_size() {
+        // 1 KiB blocks: ~300 blocks, far more than the 2 * workers window,
+        // so the read-ahead bound and out-of-order completion are exercised.
+        let data = text_like(300_000, 0x5eed_0001);
+
+        for (level, encode) in [(1, encode_level1 as fn(&[u8], u32, u64) -> Vec<u8>), (3, encode_level3), (6, encode_level6)] {
+            let encoded = encode(&data, 1024, 1);
+
+            for jobs in [1, 2, 8] {
+                for chunk in [7, 4096, usize::MAX] {
+                    let (out, res) = decode_streaming(ChunkedReader { data: &encoded, chunk }, jobs);
+                    res.unwrap_or_else(|e| panic!("level {level} jobs {jobs} chunk {chunk}: {e}"));
+                    assert!(out == data, "level {level} jobs {jobs} chunk {chunk}: output mismatch");
+                }
+            }
+
+            let mut sink = Vec::new();
+            assert_eq!(decode_to(encoded.as_slice(), &mut sink).unwrap(), data.len() as u64);
+            assert!(sink == data, "level {level}: decode_to mismatch");
+            assert!(decode(&encoded).unwrap() == data, "level {level}: decode mismatch");
+        }
+    }
+
+    #[test]
+    fn streaming_decode_errors_in_stream_order_regardless_of_jobs() {
+        let data = text_like(200_000, 0x5eed_0002);
+        let encoded = encode_level1(&data, 1024, 1);
+
+        // Corrupt two spots; with per-block XXH32 checksums both are
+        // detected, and every thread count must report the earlier one and
+        // emit exactly the blocks before it.
+        for spots in [[0.35, 0.70], [0.70, 0.35], [0.50, 0.51]] {
+            let mut corrupt = encoded.clone();
+
+            for f in spots {
+                let at = (corrupt.len() as f64 * f) as usize;
+                corrupt[at] ^= 0x5A;
+            }
+
+            let (out1, res1) = decode_streaming(corrupt.as_slice(), 1);
+            let err1 = res1.expect_err("corruption must be detected");
+            assert!(data.starts_with(&out1), "emitted output must be a prefix of the original");
+
+            for jobs in [2, 8] {
+                let (out, res) = decode_streaming(ChunkedReader { data: &corrupt, chunk: 777 }, jobs);
+                assert_eq!(res, Err(err1.clone()), "jobs {jobs}: different error than sequential decode");
+                assert!(out == out1, "jobs {jobs}: different emitted prefix than sequential decode");
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_decode_truncated_input_is_an_error() {
+        let data = text_like(100_000, 0x5eed_0003);
+        let encoded = encode_level1(&data, 1024, 0);
+
+        for cut in [encoded.len() - 1, encoded.len() * 3 / 5, 40] {
+            for jobs in [1, 8] {
+                let (out, res) = decode_streaming(&encoded[..cut], jobs);
+                assert!(res.is_err(), "cut at {cut}, jobs {jobs}: truncation not reported");
+                assert!(data.starts_with(&out), "cut at {cut}, jobs {jobs}: emitted output not a prefix");
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_decode_stops_on_write_error() {
+        struct FailingWriter {
+            left: usize,
+        }
+
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.left == 0 {
+                    return Err(std::io::Error::other("disk full"));
+                }
+
+                let n = buf.len().min(self.left);
+                self.left -= n;
+                Ok(n)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let data = text_like(200_000, 0x5eed_0004);
+        let encoded = encode_level3(&data, 1024, 0);
+        let err = decode_to(encoded.as_slice(), &mut FailingWriter { left: 50_000 }).unwrap_err();
+        assert!(err.contains("disk full"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn streaming_decode_reads_ahead_only_a_bounded_window() {
+        struct CountingReader<'a> {
+            data: &'a [u8],
+            read: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+
+        impl std::io::Read for CountingReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(self.data.len());
+                buf[..n].copy_from_slice(&self.data[..n]);
+                self.data = &self.data[n..];
+                self.read.set(self.read.get() + n);
+                Ok(n)
+            }
+        }
+
+        // Incompressible 256 KiB blocks, larger than the reader's 64 KiB
+        // read-ahead, so input consumed tracks blocks read.
+        let block = 256 * 1024;
+        let mut state = 0x5eed_0005u64;
+        let data: Vec<u8> = (0..32 * block)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        let encoded = encode_level1(&data, block as u32, 0);
+
+        for jobs in [1, 2, 4] {
+            let read = std::rc::Rc::new(std::cell::Cell::new(0));
+            let window = if jobs == 1 { 1 } else { 2 * jobs };
+            let mut emitted = 0;
+            let mut out = Vec::new();
+
+            decode_with(CountingReader { data: &encoded, read: read.clone() }, Some(jobs), |b| {
+                emitted += 1;
+                let bound = (emitted + window + 1) * (block + 4096) + BlockReader::<&[u8]>::READ_AHEAD;
+                assert!(
+                    read.get() <= bound,
+                    "jobs {jobs}: {} bytes read by block {emitted}, bound {bound}",
+                    read.get()
+                );
+                out.extend_from_slice(&b);
+                Ok(())
+            })
+            .unwrap();
+
+            assert!(out == data);
+        }
+    }
+
+    #[test]
+    fn streaming_decode_rejects_oversized_block_length_prefix() {
+        // A valid header followed by a length prefix claiming a block far
+        // larger than the header's block size allows must be rejected
+        // before any attempt to allocate or read that much.
+        let encoded = encode_level1(b"hello", 1024, 0);
+        let mut reader = BlockReader::new(encoded.as_slice(), false);
+        reader.read_header().unwrap();
+        let header_bits = reader.pos;
+
+        let mut bw = BitWriter::new();
+        let mut br = BitReader::new(&encoded);
+        let mut left = header_bits;
+
+        while left > 0 {
+            let n = left.min(32);
+            bw.write_bits(br.read_bits(n as u32), n as u32);
+            left -= n;
+        }
+
+        bw.write_bits(34 - 3, 5);
+        bw.write_bits(1 << 33, 34);
+        let forged = bw.finish();
+
+        for jobs in [1, 8] {
+            let (_, res) = decode_streaming(forged.as_slice(), jobs);
+            let err = res.expect_err("oversized block must be rejected");
+            assert!(err.contains("Invalid block size"), "unexpected error: {err}");
+        }
     }
 }

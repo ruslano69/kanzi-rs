@@ -68,14 +68,18 @@ fn compress_to_file(path: &str, level: i32) -> PyResult<()> {
 }
 
 /// Decompress a .kanzi container back to the original file.
+///
+/// The output replaces the input file in place, so the input is read fully
+/// first; the decoded data itself is streamed to disk block by block rather
+/// than assembled in memory.
 #[pyfunction]
-fn decompress_to_file(path: &str) -> PyResult<()> {
+fn decompress_to_file(py: Python<'_>, path: &str) -> PyResult<()> {
     let data = std::fs::read(path)
         .map_err(|e| PyIOError::new_err(format!("failed to read {}: {}", path, e)))?;
-    let decoded = kanzi_core::decompress(&data)
-        .map_err(|e| PyRuntimeError::new_err(format!("decode error: {}", e)))?;
-    std::fs::write(path, &decoded)
+    let mut out = std::fs::File::create(path)
         .map_err(|e| PyIOError::new_err(format!("failed to write {}: {}", path, e)))?;
+    py.detach(|| kanzi_core::decompress_to(data.as_slice(), &mut out))
+        .map_err(|e| PyRuntimeError::new_err(format!("decode error: {}", e)))?;
     Ok(())
 }
 

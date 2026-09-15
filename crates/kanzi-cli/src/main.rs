@@ -33,7 +33,7 @@ fn main() {
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level1(&data, block_size, ck_size);
-            fs::write(&args[3], &out).expect("write output");
+            write_chunked(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
                 data.len(),
@@ -49,7 +49,7 @@ fn main() {
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level2(&data, block_size, ck_size);
-            fs::write(&args[3], &out).expect("write output");
+            write_chunked(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
                 data.len(),
@@ -79,7 +79,7 @@ fn main() {
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level3(&data, block_size, ck_size);
-            fs::write(&args[3], &out).expect("write output");
+            write_chunked(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
                 data.len(),
@@ -361,7 +361,7 @@ fn main() {
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level9(&data, block_size, ck_size);
-            fs::write(&args[3], &out).expect("write output");
+            write_chunked(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
                 data.len(),
@@ -377,7 +377,7 @@ fn main() {
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level8(&data, block_size, ck_size);
-            fs::write(&args[3], &out).expect("write output");
+            write_chunked(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
                 data.len(),
@@ -393,7 +393,7 @@ fn main() {
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level0(&data, block_size, ck_size);
-            fs::write(&args[3], &out).expect("write output");
+            write_chunked(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
                 data.len(),
@@ -409,7 +409,7 @@ fn main() {
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level7(&data, block_size, ck_size);
-            fs::write(&args[3], &out).expect("write output");
+            write_chunked(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
                 data.len(),
@@ -425,7 +425,7 @@ fn main() {
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level6(&data, block_size, ck_size);
-            fs::write(&args[3], &out).expect("write output");
+            write_chunked(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
                 data.len(),
@@ -441,7 +441,7 @@ fn main() {
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level5(&data, block_size, ck_size);
-            fs::write(&args[3], &out).expect("write output");
+            write_chunked(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
                 data.len(),
@@ -457,7 +457,7 @@ fn main() {
             let data = fs::read(&args[2]).expect("read input");
             let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
             let out = container::encode_level4(&data, block_size, ck_size);
-            fs::write(&args[3], &out).expect("write output");
+            write_chunked(&args[3], &out).expect("write output");
             println!(
                 "encoded {} -> {} bytes ({:.2}%)",
                 data.len(),
@@ -521,33 +521,38 @@ fn main() {
         }
         // decode <input.knz> <output> [reps]
         //
-        // With `reps` > 1 the decode is repeated in-process and the fastest
-        // run is reported, so the number is comparable with kanzi-cpp's own
-        // "Decompression time" (which likewise excludes process start-up).
+        // Streams file to file: memory is bounded by the block size, not the
+        // file size. The reported time covers reading, decoding and writing,
+        // like kanzi-cpp's own "Decompression time" (which likewise excludes
+        // process start-up); with `reps` > 1 the fastest run is reported.
         // Thread count follows KANZI_JOBS, the equivalent of kanzi-cpp's -j.
         "decode" => {
-            let data = fs::read(&args[2]).expect("read input");
             let reps: usize = args.get(4).map(|s| s.parse().unwrap_or(1)).unwrap_or(1);
             let mut best = f64::MAX;
-            let mut out = Vec::new();
+            let mut sizes = (0, 0);
 
             for _ in 0..reps.max(1) {
                 let t0 = std::time::Instant::now();
-                out = match container::decode(&data) {
-                    Ok(o) => o,
+                let input = fs::File::open(&args[2]).expect("open input");
+                let mut output = fs::File::create(&args[3]).expect("create output");
+
+                let written = match kanzi::decompress_to(&input, &mut output) {
+                    Ok(n) => n,
                     Err(e) => {
                         eprintln!("decode failed: {}", e);
                         std::process::exit(1);
                     }
                 };
+
+                drop(output);
                 best = best.min(t0.elapsed().as_secs_f64() * 1000.0);
+                sizes = (input.metadata().map(|m| m.len()).unwrap_or(0), written);
             }
 
-            write_chunked(&args[3], &out).expect("write output");
             println!(
                 "decoded {} -> {} bytes in {:.1} ms (best of {})",
-                data.len(),
-                out.len(),
+                sizes.0,
+                sizes.1,
                 best,
                 reps.max(1)
             );
@@ -559,10 +564,10 @@ fn main() {
     }
 }
 
-/// Writes `data` in 4 MiB pieces. On Windows a single `WriteFile` of a
-/// multi-hundred-MB buffer (what `fs::write` issues) goes 4-5x slower through
-/// the cache manager than the same bytes in block-sized writes: 255-338 ms vs
-/// 57-73 ms for 212 MB on an i3-12100 / NVMe.
+/// Writes `data` in 4 MiB pieces, for the `encodeN` outputs. On Windows a
+/// single `WriteFile` of a multi-hundred-MB buffer (what `fs::write` issues)
+/// goes 4-5x slower through the cache manager than the same bytes in
+/// block-sized writes: 255-338 ms vs 57-73 ms for 212 MB on an i3-12100 / NVMe.
 fn write_chunked(path: &str, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 

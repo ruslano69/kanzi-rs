@@ -89,7 +89,16 @@ pub fn compress(data: &[u8], level: u32, block_size: Option<u32>) -> Result<Vec<
     Ok(out)
 }
 
-/// Decompresses a complete Kanzi container back to the original bytes.
+/// Decompresses a complete Kanzi container held in memory.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     container::decode(data)
+}
+
+/// Decompresses a Kanzi container from `input` into `out`, streaming both
+/// ways: memory stays bounded by the stream's block size (a few blocks at a
+/// time), not by the input or output size. Returns the number of bytes
+/// written. On error, output for the blocks before the failing one has
+/// already been written.
+pub fn decompress_to<R: std::io::Read, W: std::io::Write>(input: R, out: &mut W) -> Result<u64, String> {
+    container::decode_to(input, out)
 }
