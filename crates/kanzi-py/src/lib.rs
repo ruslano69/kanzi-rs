@@ -54,16 +54,18 @@ fn decompress<'py>(py: Python<'py>, data: PyBackedBytes) -> PyResult<Bound<'py, 
     Ok(PyBytes::new(py, &out))
 }
 
-/// Convenience: compress a file and write the .kanzi container to a new file.
+/// Convenience: compress a file and write the .kanzi container to a new file,
+/// streaming both ways (memory bounded by the block size).
 #[pyfunction]
-fn compress_to_file(path: &str, level: i32) -> PyResult<()> {
+fn compress_to_file(py: Python<'_>, path: &str, level: i32) -> PyResult<()> {
     let level = checked_level(level)?;
-    let data = std::fs::read(path)
+    let input = std::fs::File::open(path)
         .map_err(|e| PyIOError::new_err(format!("failed to read {}: {}", path, e)))?;
-    let compressed = kanzi_core::compress(&data, level, None).map_err(PyValueError::new_err)?;
     let out_path = format!("{}.kanzi", path);
-    std::fs::write(&out_path, &compressed)
+    let mut out = std::fs::File::create(&out_path)
         .map_err(|e| PyIOError::new_err(format!("failed to write {}: {}", out_path, e)))?;
+    py.detach(|| kanzi_core::compress_to(input, &mut out, level, None))
+        .map_err(PyIOError::new_err)?;
     Ok(())
 }
 

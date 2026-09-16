@@ -89,6 +89,23 @@ pub fn compress(data: &[u8], level: u32, block_size: Option<u32>) -> Result<Vec<
     Ok(out)
 }
 
+/// Compresses `input` at `level` (0-9) into a complete Kanzi container
+/// written to `out`, streaming both ways: memory stays bounded by the block
+/// size (a few blocks at a time), not by the input size. Returns the number
+/// of bytes written. The output is byte-identical to [`compress`].
+pub fn compress_to<R: std::io::Read, W: std::io::Write>(
+    input: R,
+    out: &mut W,
+    level: u32,
+    block_size: Option<u32>,
+) -> Result<u64, String> {
+    if level > 9 {
+        return Err(format!("level must be 0-9, got {level}"));
+    }
+
+    container::encode_to(input, out, level, block_size.unwrap_or_else(|| default_block_size(level)), 0)
+}
+
 /// Decompresses a complete Kanzi container held in memory.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     container::decode(data)

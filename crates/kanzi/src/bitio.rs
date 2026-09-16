@@ -56,13 +56,22 @@ impl BitWriter {
             i = nbytes;
             remaining -= nbytes * 8;
         } else {
-            // Unaligned: one byte out per byte in. Doing this through
-            // `write_bits` (8 bits -> 8 inner iterations) was ~8x slower and
-            // dominated container framing, where the block-length prefix is
-            // almost never a multiple of 8 bits.
+            // Unaligned: one byte out per byte in, the pending `nb` bits in
+            // front. Container framing lands here for every block (the
+            // block-length prefix is almost never a multiple of 8 bits), so
+            // shift 8 bytes at a time through a big-endian u64; byte by byte
+            // this ran ~1 GB/s and dominated encoding at levels 0-1.
             let nb = self.nbits;
 
-            for _ in 0..nbytes {
+            while i + 8 <= nbytes {
+                let w = u64::from_be_bytes(data[i..i + 8].try_into().unwrap());
+                let out = ((self.cur as u64) << 56) | (w >> nb);
+                self.out.extend_from_slice(&out.to_be_bytes());
+                self.cur = ((w & 0xFF) as u8) << (8 - nb);
+                i += 8;
+            }
+
+            while i < nbytes {
                 let b = data[i];
                 self.out.push(self.cur | (b >> nb));
                 self.cur = b << (8 - nb);
@@ -76,6 +85,20 @@ impl BitWriter {
             let top = data[i] >> (8 - remaining);
             self.write_bits(top as u64, remaining as u32);
         }
+    }
+
+    /// Writes the complete bytes accumulated so far to `w`, in pieces of at
+    /// most 4 MiB, and clears them (keeping the allocation), leaving only a
+    /// pending partial byte. Lets a stream be framed incrementally instead of
+    /// assembled in memory. `bit_len` keeps counting only the undrained bits.
+    pub fn drain_to<W: std::io::Write>(&mut self, w: &mut W) -> std::io::Result<usize> {
+        for chunk in self.out.chunks(4 << 20) {
+            w.write_all(chunk)?;
+        }
+
+        let n = self.out.len();
+        self.out.clear();
+        Ok(n)
     }
 
     /// Total bits written so far.
@@ -266,6 +289,37 @@ impl<'a> BitReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `write_array` against writing the same bits one byte at a time with
+    /// `write_bits`, from every starting bit offset, across the 8-byte fast
+    /// path's boundaries and with a trailing partial byte.
+    #[test]
+    fn write_array_matches_bytewise_write_bits() {
+        let data: Vec<u8> = (0..300u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+
+        for lead_bits in 0..8u32 {
+            for count_bits in [0usize, 7, 8, 63, 64, 65, 71, 72, 80, 800, 1601, 2400] {
+                let mut fast = BitWriter::new();
+                fast.write_bits(0b1011_0101, lead_bits.max(1));
+                fast.write_array(&data, count_bits);
+
+                let mut slow = BitWriter::new();
+                slow.write_bits(0b1011_0101, lead_bits.max(1));
+
+                for b in &data[..count_bits / 8] {
+                    slow.write_bits(*b as u64, 8);
+                }
+
+                if count_bits % 8 != 0 {
+                    slow.write_bits((data[count_bits / 8] >> (8 - count_bits % 8)) as u64, (count_bits % 8) as u32);
+                }
+
+                let ctx = format!("lead_bits={lead_bits} count_bits={count_bits}");
+                assert_eq!(fast.bit_len(), slow.bit_len(), "{ctx}");
+                assert_eq!(fast.finish(), slow.finish(), "{ctx}");
+            }
+        }
+    }
 
     /// `read_array` against the simplest possible reference -- `read_bits`
     /// one byte at a time -- at every bit offset, for lengths that cross

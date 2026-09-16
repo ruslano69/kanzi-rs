@@ -25,38 +25,8 @@ fn main() {
 
     match args[1].as_str() {
         "lzxtest" => lzx_test(&args[2]),
-        "encode1" => {
-            let block_size: u32 = args
-                .get(4)
-                .map(|s| s.parse().unwrap())
-                .unwrap_or_else(|| default_block_size(1));
-            let data = fs::read(&args[2]).expect("read input");
-            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
-            let out = container::encode_level1(&data, block_size, ck_size);
-            write_chunked(&args[3], &out).expect("write output");
-            println!(
-                "encoded {} -> {} bytes ({:.2}%)",
-                data.len(),
-                out.len(),
-                100.0 * out.len() as f64 / data.len() as f64
-            );
-        }
-        "encode2" => {
-            let block_size: u32 = args
-                .get(4)
-                .map(|s| s.parse().unwrap())
-                .unwrap_or_else(|| default_block_size(2));
-            let data = fs::read(&args[2]).expect("read input");
-            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
-            let out = container::encode_level2(&data, block_size, ck_size);
-            write_chunked(&args[3], &out).expect("write output");
-            println!(
-                "encoded {} -> {} bytes ({:.2}%)",
-                data.len(),
-                out.len(),
-                100.0 * out.len() as f64 / data.len() as f64
-            );
-        }
+        "encode1" => encode_file(1, &args),
+        "encode2" => encode_file(2, &args),
         "huftest" => {
             let data = fs::read(&args[2]).expect("read input");
             let mut enc = HuffmanEncoder::new();
@@ -71,22 +41,7 @@ fn main() {
                 100.0 * bytes.len() as f64 / data.len() as f64
             );
         }
-        "encode3" => {
-            let block_size: u32 = args
-                .get(4)
-                .map(|s| s.parse().unwrap())
-                .unwrap_or_else(|| default_block_size(3));
-            let data = fs::read(&args[2]).expect("read input");
-            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
-            let out = container::encode_level3(&data, block_size, ck_size);
-            write_chunked(&args[3], &out).expect("write output");
-            println!(
-                "encoded {} -> {} bytes ({:.2}%)",
-                data.len(),
-                out.len(),
-                100.0 * out.len() as f64 / data.len() as f64
-            );
-        }
+        "encode3" => encode_file(3, &args),
         "texttest" => text_test(
             &args[2],
             args.get(3)
@@ -353,118 +308,13 @@ fn main() {
             fs::write(&args[3], &back).expect("write output");
             println!("rust tpaq-decoded {} -> {} bytes", enc_bytes.len(), back.len());
         }
-        "encode9" => {
-            let block_size: u32 = args
-                .get(4)
-                .map(|s| s.parse().unwrap())
-                .unwrap_or_else(|| default_block_size(9));
-            let data = fs::read(&args[2]).expect("read input");
-            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
-            let out = container::encode_level9(&data, block_size, ck_size);
-            write_chunked(&args[3], &out).expect("write output");
-            println!(
-                "encoded {} -> {} bytes ({:.2}%)",
-                data.len(),
-                out.len(),
-                100.0 * out.len() as f64 / data.len() as f64
-            );
-        }
-        "encode8" => {
-            let block_size: u32 = args
-                .get(4)
-                .map(|s| s.parse().unwrap())
-                .unwrap_or_else(|| default_block_size(8));
-            let data = fs::read(&args[2]).expect("read input");
-            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
-            let out = container::encode_level8(&data, block_size, ck_size);
-            write_chunked(&args[3], &out).expect("write output");
-            println!(
-                "encoded {} -> {} bytes ({:.2}%)",
-                data.len(),
-                out.len(),
-                100.0 * out.len() as f64 / data.len() as f64
-            );
-        }
-        "encode0" => {
-            let block_size: u32 = args
-                .get(4)
-                .map(|s| s.parse().unwrap())
-                .unwrap_or_else(|| default_block_size(0));
-            let data = fs::read(&args[2]).expect("read input");
-            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
-            let out = container::encode_level0(&data, block_size, ck_size);
-            write_chunked(&args[3], &out).expect("write output");
-            println!(
-                "encoded {} -> {} bytes ({:.2}%)",
-                data.len(),
-                out.len(),
-                100.0 * out.len() as f64 / data.len() as f64
-            );
-        }
-        "encode7" => {
-            let block_size: u32 = args
-                .get(4)
-                .map(|s| s.parse().unwrap())
-                .unwrap_or_else(|| default_block_size(7));
-            let data = fs::read(&args[2]).expect("read input");
-            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
-            let out = container::encode_level7(&data, block_size, ck_size);
-            write_chunked(&args[3], &out).expect("write output");
-            println!(
-                "encoded {} -> {} bytes ({:.2}%)",
-                data.len(),
-                out.len(),
-                100.0 * out.len() as f64 / data.len() as f64
-            );
-        }
-        "encode6" => {
-            let block_size: u32 = args
-                .get(4)
-                .map(|s| s.parse().unwrap())
-                .unwrap_or_else(|| default_block_size(6));
-            let data = fs::read(&args[2]).expect("read input");
-            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
-            let out = container::encode_level6(&data, block_size, ck_size);
-            write_chunked(&args[3], &out).expect("write output");
-            println!(
-                "encoded {} -> {} bytes ({:.2}%)",
-                data.len(),
-                out.len(),
-                100.0 * out.len() as f64 / data.len() as f64
-            );
-        }
-        "encode5" => {
-            let block_size: u32 = args
-                .get(4)
-                .map(|s| s.parse().unwrap())
-                .unwrap_or_else(|| default_block_size(5));
-            let data = fs::read(&args[2]).expect("read input");
-            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
-            let out = container::encode_level5(&data, block_size, ck_size);
-            write_chunked(&args[3], &out).expect("write output");
-            println!(
-                "encoded {} -> {} bytes ({:.2}%)",
-                data.len(),
-                out.len(),
-                100.0 * out.len() as f64 / data.len() as f64
-            );
-        }
-        "encode4" => {
-            let block_size: u32 = args
-                .get(4)
-                .map(|s| s.parse().unwrap())
-                .unwrap_or_else(|| default_block_size(4));
-            let data = fs::read(&args[2]).expect("read input");
-            let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
-            let out = container::encode_level4(&data, block_size, ck_size);
-            write_chunked(&args[3], &out).expect("write output");
-            println!(
-                "encoded {} -> {} bytes ({:.2}%)",
-                data.len(),
-                out.len(),
-                100.0 * out.len() as f64 / data.len() as f64
-            );
-        }
+        "encode9" => encode_file(9, &args),
+        "encode8" => encode_file(8, &args),
+        "encode0" => encode_file(0, &args),
+        "encode7" => encode_file(7, &args),
+        "encode6" => encode_file(6, &args),
+        "encode5" => encode_file(5, &args),
+        "encode4" => encode_file(4, &args),
         "anstest" => ans_test(
             &args[2],
             args.get(3).map(|s| s.parse().unwrap_or(0)).unwrap_or(0),
@@ -564,20 +414,30 @@ fn main() {
     }
 }
 
-/// Writes `data` in 4 MiB pieces, for the `encodeN` outputs. On Windows a
-/// single `WriteFile` of a multi-hundred-MB buffer (what `fs::write` issues)
-/// goes 4-5x slower through the cache manager than the same bytes in
-/// block-sized writes: 255-338 ms vs 57-73 ms for 212 MB on an i3-12100 / NVMe.
-fn write_chunked(path: &str, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
+/// `encodeN <input> <output> [blockSize] [ckSize]`: streams file to file, so
+/// memory is bounded by the block size rather than the file size.
+fn encode_file(level: u32, args: &[String]) {
+    let block_size: u32 = args
+        .get(4)
+        .map(|s| s.parse().unwrap())
+        .unwrap_or_else(|| default_block_size(level));
+    let ck_size: u64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(0);
+    let input = fs::File::open(&args[2]).expect("open input");
+    let in_len = input.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut output = fs::File::create(&args[3]).expect("create output");
 
-    let mut f = fs::File::create(path)?;
-
-    for chunk in data.chunks(4 << 20) {
-        f.write_all(chunk)?;
+    match container::encode_to(input, &mut output, level, block_size, ck_size) {
+        Ok(written) => println!(
+            "encoded {} -> {} bytes ({:.2}%)",
+            in_len,
+            written,
+            100.0 * written as f64 / in_len.max(1) as f64
+        ),
+        Err(e) => {
+            eprintln!("encode failed: {}", e);
+            std::process::exit(1);
+        }
     }
-
-    Ok(())
 }
 
 fn text_test(prefix: &str, block_size: u32) {
