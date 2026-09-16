@@ -9,15 +9,22 @@ the kanzi-go project. See [Attribution & license](#attribution--license).
 
 ## What's here
 
-- `src/` — the codec itself: bitstream I/O, the BWT/SA-IS suffix array construction,
-  LZ/LZX/ROLZ, RLT/ZRLT, rank/MTF transforms, the TEXT/UTF/EXE/DNA filters, and the
-  entropy coders (Huffman, ANS0, FPAQ, CM, TPAQ/TPAQX) that back Kanzi's compression
-  levels 0-9.
-- `src/main.rs` — a CLI binary for exercising and cross-checking the port against the
-  real kanzi-go binary (see `verify/`).
-- `src/lib.rs` — the PyO3 extension module (built as `kanzi` by [maturin](https://www.maturin.rs/)).
-- `examples/benchmark.py` — density/speed-by-level benchmark, run against real files
-  already in this repo rather than synthetic data (see below).
+A Cargo workspace with three crates:
+
+- `crates/kanzi` — the codec itself, pure Rust with no Python dependency: bitstream
+  I/O, the BWT/suffix array construction, LZ/LZX/ROLZ, RLT/ZRLT, rank/MTF transforms,
+  the TEXT/UTF/EXE/DNA filters, and the entropy coders (Huffman, ANS0, FPAQ, CM,
+  TPAQ/TPAQX) that back Kanzi's compression levels 0-9. `kanzi::compress` /
+  `kanzi::decompress` cover the whole container.
+- `crates/kanzi-cli` — the `rust_kanzi` binary, for encoding/decoding files and
+  cross-checking the port against the real kanzi-go/kanzi-cpp binaries (see `verify/`).
+- `crates/kanzi-py` — the PyO3 extension module (built as `kanzi` by
+  [maturin](https://www.maturin.rs/)), a thin wrapper over `crates/kanzi`.
+- `crates/kanzi-py/examples/benchmark.py` — density/speed-by-level benchmark, run
+  against real files already in this repo rather than synthetic data (see below).
+
+Plain `cargo build` / `cargo test` build and test only the pure-Rust crates; the
+Python module is built by maturin.
 
 ## Compression levels
 
@@ -47,12 +54,12 @@ cargo build --release
 ./target/release/rust_kanzi decode output.knz restored.bin
 ```
 
-An optional `fast-sa` feature swaps the in-tree SA-IS suffix array construction for
-[libsais](https://github.com/IlyaGrebnov/libsais) (single-threaded, so it doesn't
-oversubscribe alongside this project's own per-block concurrency):
+Suffix array construction uses [libsais](https://github.com/IlyaGrebnov/libsais) via
+the default `fast-sa` feature, which needs a C compiler at build time. Without one,
+build the pure-Rust fallback (a port of kanzi-cpp's DivSufSort):
 
 ```bash
-cargo build --release --features fast-sa
+cargo build --release --no-default-features
 ```
 
 ## Building the Python module
@@ -95,7 +102,7 @@ whichever CPython version you're targeting.
 ### Benchmarking
 
 ```bash
-python examples/benchmark.py
+python crates/kanzi-py/examples/benchmark.py
 ```
 
 Reports compressed size, ratio and encode/decode throughput per level against real
@@ -104,7 +111,8 @@ built wheel) plus a random-bytes incompressible baseline — deliberately not
 synthetic/repetitive data, since that's what caught a real encoder bug during
 development (see git log).
 
-See [BENCHMARKS.md](BENCHMARKS.md) for numbers against the Silesia corpus.
+See [BENCHMARKS.md](BENCHMARKS.md) for numbers against the Silesia corpus, and
+[CHANGELOG.md](CHANGELOG.md) for what changed between releases.
 
 ## Status
 

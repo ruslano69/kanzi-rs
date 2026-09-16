@@ -576,8 +576,23 @@ impl LzxCodec {
                     return Err("invalid literal length");
                 }
 
-                dst[dst_idx as usize..(dst_idx + lit_len) as usize]
-                    .copy_from_slice(&src[src_idx as usize..(src_idx + lit_len) as usize]);
+                let (s, d, len) = (src_idx as usize, dst_idx as usize, lit_len as usize);
+
+                if s + len + 16 <= count && d + len + 16 <= dst.len() {
+                    // kanzi-cpp's emitLiterals: whole 16-byte copies, which
+                    // may read and write up to 15 bytes past the run. Both
+                    // are in bounds (checked just above), and the extra dst
+                    // bytes lie past dst_idx, where later output overwrites
+                    // them before anything reads them.
+                    let mut i = 0;
+
+                    while i < len {
+                        dst[d + i..d + i + 16].copy_from_slice(&src[s + i..s + i + 16]);
+                        i += 16;
+                    }
+                } else {
+                    dst[d..d + len].copy_from_slice(&src[s..s + len]);
+                }
 
                 src_idx += lit_len;
                 dst_idx += lit_len;
@@ -717,4 +732,89 @@ fn read_length(block: &[u8]) -> (usize, usize) {
     res += (block[2] as usize) << 8;
     res += block[3] as usize;
     (res, 4)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// Mixes literal runs of every length class (short, 16-byte-crossing,
+    /// >= 0xE0 token form) with matches at small and large distances.
+    fn mixed(n: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut out = Vec::with_capacity(n);
+
+        while out.len() < n {
+            let r = xorshift(&mut state);
+
+            match r % 8 {
+                0 => {
+                    let len = 1 + (r >> 8) as usize % 260;
+                    out.extend((0..len).map(|_| xorshift(&mut state) as u8));
+                }
+                1 if out.len() > 70_000 => {
+                    let dist = 1 + (r >> 8) as usize % 70_000;
+                    let len = 4 + (r >> 32) as usize % 200;
+                    let start = out.len() - dist;
+                    for i in 0..len {
+                        out.push(out[start + i]);
+                    }
+                }
+                _ => {
+                    let dist = 1 + (r >> 8) as usize % 15;
+                    let len = 4 + (r >> 32) as usize % 40;
+                    if out.len() >= dist {
+                        let start = out.len() - dist;
+                        for i in 0..len {
+                            out.push(out[start + i]);
+                        }
+                    } else {
+                        out.push(r as u8);
+                    }
+                }
+            }
+        }
+
+        out.truncate(n);
+        out
+    }
+
+    /// Round-trips blocks of many sizes, decoding into both the smallest
+    /// output buffer `inverse` accepts (block + 16) and a roomy one, so the
+    /// 16-byte wide literal copies are exercised against both the slack
+    /// check and the exact-length fallback at the end of a block.
+    #[test]
+    fn roundtrip_sizes_and_output_slack() {
+        let mut sizes: Vec<usize> = (24..400).step_by(7).collect();
+        sizes.extend([1024, 4095, 4096, 65_537, 300_000, 1 << 20]);
+        let mut tested = 0;
+
+        for (k, &n) in sizes.iter().enumerate() {
+            let data = mixed(n, 0xABCD + k as u64);
+            let mut enc = vec![0u8; LzxCodec::max_encoded_len(n)];
+
+            let Ok((_, written)) = LzxCodec::new(true).forward(&data, &mut enc, MIN_MATCH4) else {
+                continue;
+            };
+
+            for slack in [0usize, 3, 8, 16, 1024] {
+                let mut out = vec![0u8; n + slack];
+                let (_, got) = LzxCodec::inverse(&enc[..written], &mut out)
+                    .unwrap_or_else(|e| panic!("n={n} slack={slack}: {e}"));
+                assert_eq!(got, n, "n={n} slack={slack}: length");
+                assert!(out[..n] == data[..], "n={n} slack={slack}: mismatch");
+            }
+
+            tested += 1;
+        }
+
+        assert!(tested * 4 >= sizes.len() * 3, "only {tested} of {} sizes compressed", sizes.len());
+    }
 }

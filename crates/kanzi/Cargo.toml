@@ -1,0 +1,25 @@
+[package]
+name = "kanzi"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust port of the kanzi lossless compressor (bitstream v7, byte-compatible with kanzi-go/kanzi-cpp)"
+repository = "https://github.com/ruslano69/kanzi-rs"
+
+[dependencies]
+libsais = { version = "0.2", default-features = false, optional = true }
+
+[features]
+# fast-sa (libsais for BWT's suffix array construction) is on by default:
+# it produces byte-identical output to the in-tree divsufsort.rs (see
+# BENCHMARKS.md) and is ~2x faster still, which is 38-41% faster overall at
+# levels 5-7 where BWT dominates encode time. Needs a C compiler at build
+# time (present by default on GitHub-hosted Linux/Windows/macOS runners and
+# most dev machines); opt out with --no-default-features if you don't have
+# one -- the pure-Rust divsufsort.rs (a port of kanzi-cpp's DivSufSort)
+# remains fully supported and is itself 1.5-2.7x faster than this crate's
+# original pure-Rust SA-IS backend (sais.rs, now kept only as a test
+# oracle), so going without a C toolchain is far less of a speed cliff than
+# it used to be.
+default = ["fast-sa"]
+fast-sa = ["dep:libsais"]

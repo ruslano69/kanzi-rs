@@ -1,0 +1,23 @@
+[package]
+name = "kanzi-py"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Python bindings (PyO3) for the kanzi crate"
+repository = "https://github.com/ruslano69/kanzi-rs"
+
+[lib]
+name = "kanzi"          # the Python module is `import kanzi`
+crate-type = ["cdylib"]
+
+[dependencies]
+# Renamed so it doesn't clash with this crate's own `kanzi` lib target.
+kanzi_core = { package = "kanzi", path = "../kanzi", default-features = false }
+pyo3 = { version = "0.26", features = ["extension-module"] }
+
+[build-dependencies]
+pyo3-build-config = "0.26"
+
+[features]
+default = ["fast-sa"]
+fast-sa = ["kanzi_core/fast-sa"]

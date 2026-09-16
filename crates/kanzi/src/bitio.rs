@@ -1,6 +1,7 @@
 // MSB-first bit reader/writer matching kanzi-go's bitstream.DefaultInputBitStream
-// / DefaultOutputBitStream semantics. Correctness-first (no bulk/aligned fast
-// paths) since this is the container/header path, not a symbol-decode hot loop.
+// / DefaultOutputBitStream semantics. Bit-level reads and writes stay simple;
+// the bulk array paths (`read_array`/`write_array`) are the throughput-relevant
+// ones, since every block payload and entropy chunk moves through them.
 
 pub struct BitWriter {
     out: Vec<u8>,
@@ -55,13 +56,22 @@ impl BitWriter {
             i = nbytes;
             remaining -= nbytes * 8;
         } else {
-            // Unaligned: one byte out per byte in. Doing this through
-            // `write_bits` (8 bits -> 8 inner iterations) was ~8x slower and
-            // dominated container framing, where the block-length prefix is
-            // almost never a multiple of 8 bits.
+            // Unaligned: one byte out per byte in, the pending `nb` bits in
+            // front. Container framing lands here for every block (the
+            // block-length prefix is almost never a multiple of 8 bits), so
+            // shift 8 bytes at a time through a big-endian u64; byte by byte
+            // this ran ~1 GB/s and dominated encoding at levels 0-1.
             let nb = self.nbits;
 
-            for _ in 0..nbytes {
+            while i + 8 <= nbytes {
+                let w = u64::from_be_bytes(data[i..i + 8].try_into().unwrap());
+                let out = ((self.cur as u64) << 56) | (w >> nb);
+                self.out.extend_from_slice(&out.to_be_bytes());
+                self.cur = ((w & 0xFF) as u8) << (8 - nb);
+                i += 8;
+            }
+
+            while i < nbytes {
                 let b = data[i];
                 self.out.push(self.cur | (b >> nb));
                 self.cur = b << (8 - nb);
@@ -75,6 +85,20 @@ impl BitWriter {
             let top = data[i] >> (8 - remaining);
             self.write_bits(top as u64, remaining as u32);
         }
+    }
+
+    /// Writes the complete bytes accumulated so far to `w`, in pieces of at
+    /// most 4 MiB, and clears them (keeping the allocation), leaving only a
+    /// pending partial byte. Lets a stream be framed incrementally instead of
+    /// assembled in memory. `bit_len` keeps counting only the undrained bits.
+    pub fn drain_to<W: std::io::Write>(&mut self, w: &mut W) -> std::io::Result<usize> {
+        for chunk in self.out.chunks(4 << 20) {
+            w.write_all(chunk)?;
+        }
+
+        let n = self.out.len();
+        self.out.clear();
+        Ok(n)
     }
 
     /// Total bits written so far.
@@ -217,12 +241,26 @@ impl<'a> BitReader<'a> {
             i = nbytes;
             remaining -= nbytes * 8;
         } else {
-            // Unaligned: combine each output byte from two adjacent input
-            // bytes. The previous implementation went through `read_bits`
-            // (an internal multi-step loop) per 8 bits, which was far more
-            // work per byte.
+            // Unaligned: each output byte straddles two input bytes. Shift 8
+            // bytes at a time through a big-endian u64, with the following
+            // input byte supplying the low bits, while 9 input bytes remain;
+            // then finish byte by byte, where `byte_at` supplies zeros past
+            // the end. A block's payload starts after a variable-length bit
+            // header, so this path carries every container payload read
+            // (raw/transformed copies, NONE entropy, and the entropy
+            // decoders' own chunk reads); byte-at-a-time it ran ~850 MB/s.
             let bit_off = self.pos & 7;
             let mut byte_idx = self.pos >> 3;
+
+            while remaining >= 64 && byte_idx + 9 <= self.data.len() {
+                let w = u64::from_be_bytes(self.data[byte_idx..byte_idx + 8].try_into().unwrap());
+                let low = self.data[byte_idx + 8] as u64;
+                let v = (w << bit_off) | (low >> (8 - bit_off));
+                dst[i..i + 8].copy_from_slice(&v.to_be_bytes());
+                byte_idx += 8;
+                i += 8;
+                remaining -= 64;
+            }
 
             while remaining >= 8 {
                 let b0 = self.byte_at(byte_idx);
@@ -245,5 +283,84 @@ impl<'a> BitReader<'a> {
         // stream (matching a "successful" read's cursor movement) without
         // writing anywhere.
         self.pos += extra_bits;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `write_array` against writing the same bits one byte at a time with
+    /// `write_bits`, from every starting bit offset, across the 8-byte fast
+    /// path's boundaries and with a trailing partial byte.
+    #[test]
+    fn write_array_matches_bytewise_write_bits() {
+        let data: Vec<u8> = (0..300u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+
+        for lead_bits in 0..8u32 {
+            for count_bits in [0usize, 7, 8, 63, 64, 65, 71, 72, 80, 800, 1601, 2400] {
+                let mut fast = BitWriter::new();
+                fast.write_bits(0b1011_0101, lead_bits.max(1));
+                fast.write_array(&data, count_bits);
+
+                let mut slow = BitWriter::new();
+                slow.write_bits(0b1011_0101, lead_bits.max(1));
+
+                for b in &data[..count_bits / 8] {
+                    slow.write_bits(*b as u64, 8);
+                }
+
+                if count_bits % 8 != 0 {
+                    slow.write_bits((data[count_bits / 8] >> (8 - count_bits % 8)) as u64, (count_bits % 8) as u32);
+                }
+
+                let ctx = format!("lead_bits={lead_bits} count_bits={count_bits}");
+                assert_eq!(fast.bit_len(), slow.bit_len(), "{ctx}");
+                assert_eq!(fast.finish(), slow.finish(), "{ctx}");
+            }
+        }
+    }
+
+    /// `read_array` against the simplest possible reference -- `read_bits`
+    /// one byte at a time -- at every bit offset, for lengths that cross
+    /// the 8-byte fast path's boundaries, run past the end of the data, are
+    /// not whole bytes, or exceed `dst`.
+    #[test]
+    fn read_array_matches_bytewise_read_bits() {
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let data: Vec<u8> = (0..300)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+
+        for start_bit in 0..16 {
+            for count_bits in [0usize, 7, 8, 63, 64, 65, 71, 72, 80, 800, 1601, 2400, 2500] {
+                for dst_len in [count_bits / 8, count_bits.div_ceil(8), 40] {
+                    let mut fast = BitReader::at_bit_pos(&data, start_bit);
+                    let mut got = vec![0xAAu8; dst_len];
+                    fast.read_array(&mut got, count_bits);
+
+                    let mut slow = BitReader::at_bit_pos(&data, start_bit);
+                    let mut want = vec![0xAAu8; dst_len];
+                    let bits = count_bits.min(dst_len * 8);
+
+                    for b in want.iter_mut().take(bits / 8) {
+                        *b = slow.read_bits(8) as u8;
+                    }
+
+                    if bits % 8 != 0 {
+                        want[bits / 8] = (slow.read_bits((bits % 8) as u32) as u8) << (8 - bits % 8);
+                    }
+
+                    let ctx = format!("start_bit={start_bit} count_bits={count_bits} dst_len={dst_len}");
+                    assert_eq!(got, want, "{ctx}");
+                    assert_eq!(fast.bits_read(), start_bit + count_bits, "{ctx}: cursor");
+                }
+            }
+        }
     }
 }

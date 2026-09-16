@@ -325,6 +325,57 @@ impl Bwt {
             return Ok((0, 0));
         }
 
+        let (header_size, block_size) = self.read_inverse_header(src)?;
+        let payload = &src[header_size..header_size + block_size];
+
+        // BiPSIv2 above BIPSI_THRESHOLD, MergeTPSI below it -- see
+        // BENCHMARKS.md's "decode thread pool" section for the size x
+        // content-type sweep this threshold is drawn from. Single-threaded:
+        // the same sweep found threading BiPSIv2 itself adds only ~3-8%
+        // beyond 1 thread on this machine (memory-bandwidth-, not
+        // spawn-cost-, bound past small thread counts), too little to
+        // justify wiring spare-thread lending through the decode call
+        // stack on top of the larger, already-banked algorithmic win.
+        if block_size >= BIPSI_THRESHOLD {
+            self.inverse_bipsiv2(payload, dst, block_size, 1)
+        } else {
+            self.inverse_merge_tpsi(payload, dst, block_size)
+        }
+    }
+
+    /// [`Bwt::inverse`] with the output overwriting the input: `buf` holds
+    /// the forward transform's output (header + payload) and, on success,
+    /// exactly the recovered block. Both inverse algorithms read the payload
+    /// only while building their tables and never while emitting, so this
+    /// needs no separate block-sized output buffer -- on the container's BWT
+    /// levels that is one buffer the size of the block less per block in
+    /// flight, next to the 4-bytes-per-byte tables themselves.
+    pub fn inverse_in_place(&mut self, buf: &mut Vec<u8>) -> Result<usize, &'static str> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let (header_size, block_size) = self.read_inverse_header(buf)?;
+        let payload = &buf[header_size..header_size + block_size];
+
+        if block_size >= BIPSI_THRESHOLD {
+            let tables = self.bipsiv2_build(payload, block_size)?;
+            self.bipsiv2_emit(tables, &mut buf[..block_size], block_size, 1);
+        } else {
+            match self.merge_tpsi_build(payload, block_size)? {
+                MergeTpsiStart::Single(b) => buf[0] = b,
+                MergeTpsiStart::Chains(p_idx) => self.merge_tpsi_emit(&mut buf[..block_size], block_size, p_idx),
+            }
+        }
+
+        buf.truncate(block_size);
+        Ok(block_size)
+    }
+
+    /// Parses the chunk-count / primary-index header in front of a BWT
+    /// payload into `self.primary_indexes`; returns (header size, payload
+    /// size). `src` must not be empty.
+    fn read_inverse_header(&mut self, src: &[u8]) -> Result<(usize, usize), &'static str> {
         if src.len() == 1 {
             return Err("BWT inverse transform failed: invalid size");
         }
@@ -372,21 +423,7 @@ impl Bwt {
             self.primary_indexes[i] = primary_index + 1;
         }
 
-        let payload = &src[header_size..header_size + block_size];
-
-        // BiPSIv2 above BIPSI_THRESHOLD, MergeTPSI below it -- see
-        // BENCHMARKS.md's "decode thread pool" section for the size x
-        // content-type sweep this threshold is drawn from. Single-threaded:
-        // the same sweep found threading BiPSIv2 itself adds only ~3-8%
-        // beyond 1 thread on this machine (memory-bandwidth-, not
-        // spawn-cost-, bound past small thread counts), too little to
-        // justify wiring spare-thread lending through the decode call
-        // stack on top of the larger, already-banked algorithmic win.
-        if block_size >= BIPSI_THRESHOLD {
-            self.inverse_bipsiv2(payload, dst, block_size, 1)
-        } else {
-            self.inverse_merge_tpsi(payload, dst, block_size)
-        }
+        Ok((header_size, block_size))
     }
 
     /// Port of BWT.inverseMergeTPSI (sequential, jobs=1).
@@ -396,17 +433,27 @@ impl Bwt {
         dst: &mut [u8],
         count: usize,
     ) -> Result<(usize, usize), &'static str> {
-        if count > BWT_MERGE_TPSI_MAX {
-            return Err("BWT inverse transform failed: block too big (BiPSIv2 not ported, limit is 16 MiB)");
-        }
-
         if count > dst.len() {
             return Err("BWT inverse transform failed: output buffer too small");
         }
 
+        match self.merge_tpsi_build(src, count)? {
+            MergeTpsiStart::Single(b) => dst[0] = b,
+            MergeTpsiStart::Chains(p_idx) => self.merge_tpsi_emit(&mut dst[..count], count, p_idx),
+        }
+
+        Ok((count, count))
+    }
+
+    /// MergeTPSI's table-building half: validates the header and packs
+    /// `src` into `self.buffer`. The only half that reads `src`.
+    fn merge_tpsi_build(&mut self, src: &[u8], count: usize) -> Result<MergeTpsiStart, &'static str> {
+        if count > BWT_MERGE_TPSI_MAX {
+            return Err("BWT inverse transform failed: block too big (BiPSIv2 not ported, limit is 16 MiB)");
+        }
+
         if count == 1 {
-            dst[0] = src[0];
-            return Ok((count, count));
+            return Ok(MergeTpsiStart::Single(src[0]));
         }
 
         let p_idx = self.primary_indexes[0];
@@ -484,6 +531,22 @@ impl Bwt {
             }
         }
 
+        if get_bwt_chunks(count) == 8 {
+            for &p in &self.primary_indexes[..8] {
+                if p == 0 || p > count {
+                    return Err("BWT inverse transform failed: corrupted BWT primary index");
+                }
+            }
+        }
+
+        Ok(MergeTpsiStart::Chains(p_idx))
+    }
+
+    /// MergeTPSI's emitting half: walks the chains built by
+    /// `merge_tpsi_build` into `dst` (exactly `count` bytes).
+    fn merge_tpsi_emit(&self, dst: &mut [u8], count: usize, p_idx: usize) {
+        let data = &self.buffer[..count.max(256)];
+
         if get_bwt_chunks(count) != 8 {
             let mut t = p_idx as i32 - 1;
 
@@ -502,13 +565,7 @@ impl Bwt {
             let mut t = [0i32; 8];
 
             for (k, tk) in t.iter_mut().enumerate() {
-                let p = self.primary_indexes[k] as i32 - 1;
-
-                if p < 0 || p >= count as i32 {
-                    return Err("BWT inverse transform failed: corrupted BWT primary index");
-                }
-
-                *tk = p;
+                *tk = self.primary_indexes[k] as i32 - 1;
             }
 
             let (d0, rest) = dst.split_at_mut(ck_size);
@@ -578,7 +635,6 @@ impl Bwt {
             }
         }
 
-        Ok((count, count))
     }
 
     /// Port of kanzi-cpp's `BWT::inverseBiPSIv2` + `InverseBiPSIv2Task::run()`
@@ -627,12 +683,21 @@ impl Bwt {
         count: usize,
         num_threads: usize,
     ) -> Result<(usize, usize), &'static str> {
-        if get_bwt_chunks(count) != 8 {
-            return Err("BWT inverse (BiPSIv2) failed: block too small (needs 8 chunks)");
-        }
-
         if count > dst.len() {
             return Err("BWT inverse transform failed: output buffer too small");
+        }
+
+        let tables = self.bipsiv2_build(src, count)?;
+        self.bipsiv2_emit(tables, &mut dst[..count], count, num_threads);
+        Ok((count, count))
+    }
+
+    /// BiPSIv2's setup half: validates the primary indexes and builds the
+    /// shared `bipsi_buffer`/`bipsi_buckets`/`bipsi_fastbits` tables. The only
+    /// half that reads `src`.
+    fn bipsiv2_build(&mut self, src: &[u8], count: usize) -> Result<BipsiTables, &'static str> {
+        if get_bwt_chunks(count) != 8 {
+            return Err("BWT inverse (BiPSIv2) failed: block too small (needs 8 chunks)");
         }
 
         // Copied out (Copy type) before `self.bipsi_*` are borrowed below,
@@ -801,6 +866,18 @@ impl Bwt {
             }
         }
 
+        Ok(BipsiTables { shift, lastc: lastc as u8 })
+    }
+
+    /// BiPSIv2's emitting half: decodes the 8 chunks from the tables built by
+    /// `bipsiv2_build` into `dst` (exactly `count` bytes).
+    fn bipsiv2_emit(&self, tables: BipsiTables, dst: &mut [u8], count: usize, num_threads: usize) {
+        let primary_indexes = self.primary_indexes;
+        let data = &self.bipsi_buffer[..count + 1];
+        let buckets = &self.bipsi_buckets[..];
+        let fast_bits = &self.bipsi_fastbits[..];
+        let (shift, lastc) = (tables.shift, tables.lastc as usize);
+
         // --- Dispatch phase: 8 chunks, split across up to `num_threads`
         // tasks the same way `Global::computeJobsPerTask` does. ---
 
@@ -832,9 +909,9 @@ impl Bwt {
         }
 
         if threads == 1 {
-            bipsiv2_task_run(data, buckets, fast_bits, &mut dst[..count], &primary_indexes, shift, count, ck_size, 0, chunks);
+            bipsiv2_task_run(data, buckets, fast_bits, dst, &primary_indexes, shift, count, ck_size, 0, chunks);
         } else {
-            let mut remaining = &mut dst[..count];
+            let mut remaining = &mut dst[..];
             let mut slices: Vec<&mut [u8]> = Vec::with_capacity(threads);
 
             for &(_, _, byte_len) in &task_ranges {
@@ -843,9 +920,7 @@ impl Bwt {
                 remaining = tail;
             }
 
-            let data_ref: &[u32] = data;
-            let buckets_ref: &[u32] = buckets;
-            let fast_bits_ref: &[u16] = fast_bits;
+            let (data_ref, buckets_ref, fast_bits_ref) = (data, buckets, fast_bits);
             let primary_indexes_ref = &primary_indexes;
 
             std::thread::scope(|scope| {
@@ -888,8 +963,22 @@ impl Bwt {
 
         dst[count - 1] = lastc as u8;
 
-        Ok((count, count))
     }
+}
+
+/// What `Bwt::merge_tpsi_build` leaves for the emitting half.
+enum MergeTpsiStart {
+    /// A one-byte block is its own inverse.
+    Single(u8),
+    /// Walk the chains from this (1-based) primary index.
+    Chains(usize),
+}
+
+/// What `Bwt::bipsiv2_build` leaves for the emitting half, besides the tables
+/// stored on `Bwt` itself.
+struct BipsiTables {
+    shift: u32,
+    lastc: u8,
 }
 
 /// Port of kanzi-cpp's `Global::computeJobsPerTask(jobsPerTask, jobs,
@@ -1454,6 +1543,50 @@ mod bipsiv2_tests {
     /// run explicitly with `cargo test --release bench_bipsiv2 --
     /// --ignored --nocapture`. See BENCHMARKS.md's "decode thread pool"
     /// section for the numbers this produced and what was decided from them.
+    /// `inverse_in_place` must reproduce `inverse` exactly -- output and
+    /// errors -- for both algorithms: 1-chunk and 8-chunk MergeTPSI, and
+    /// BiPSIv2 from its threshold up.
+    #[test]
+    fn inverse_in_place_matches_inverse() {
+        let sizes = [
+            2usize,
+            3,
+            255,
+            256,
+            4099,
+            1 << 20,
+            BIPSI_THRESHOLD - 1,
+            BIPSI_THRESHOLD,
+            BIPSI_THRESHOLD + 13,
+        ];
+
+        for (k, &n) in sizes.iter().enumerate() {
+            let data = if k % 2 == 0 { make_text_like(n, 7 + n as u64) } else { make_random(n, 11 + n as u64) };
+            let mut encoded = vec![0u8; max_encoded_len(n)];
+            let (_, written) = Bwt::new().forward(&data, &mut encoded).expect("forward failed");
+            encoded.truncate(written);
+
+            let mut expected = vec![0u8; n];
+            let (_, m) = Bwt::new().inverse(&encoded, &mut expected).expect("inverse failed");
+            assert_eq!(&expected[..m], &data[..], "n={n}: inverse mismatch");
+
+            let mut buf = encoded.clone();
+            assert_eq!(Bwt::new().inverse_in_place(&mut buf), Ok(n), "n={n}");
+            assert!(buf == data, "n={n}: inverse_in_place mismatch");
+
+            // A primary index past the end must fail identically.
+            if n > 1 {
+                let mut corrupt = encoded.clone();
+                let p_index_size = (corrupt[0] & 0x03) as usize + 1;
+                corrupt[1..1 + p_index_size].fill(0xFF);
+                let mut out = vec![0u8; n];
+                let err = Bwt::new().inverse(&corrupt, &mut out).map(|_| ());
+                let mut buf = corrupt.clone();
+                assert_eq!(Bwt::new().inverse_in_place(&mut buf).map(|_| ()), err, "n={n}: error mismatch");
+            }
+        }
+    }
+
     #[test]
     #[ignore]
     fn bench_bipsiv2_vs_merge_tpsi() {

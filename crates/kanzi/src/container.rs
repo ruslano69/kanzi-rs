@@ -28,6 +28,23 @@ use crate::utf;
 use crate::xxhash::{XxHash32, XxHash64};
 use crate::zrlt;
 
+/// Number of block worker threads (encode and decode):
+/// `available_parallelism()` capped at `max`, unless `KANZI_JOBS` overrides
+/// it (the equivalent of kanzi-cpp's `-j`). Pinning this to 1 is what lets a
+/// per-block speed comparison be separated from a thread-scaling comparison.
+fn worker_count(max: usize) -> usize {
+    let avail = std::env::var("KANZI_JOBS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        });
+    avail.min(max)
+}
+
 const BITSTREAM_TYPE: u64 = 0x4B414E5A; // "KANZ"
 const BITSTREAM_FORMAT_VERSION: u64 = 7;
 const HASH: u32 = 0x1E35A7BD;
@@ -154,91 +171,170 @@ fn log2_bytes_needed(x: u32) -> u32 {
     }
 }
 
-/// Splits `data` into `block_size`-byte chunks (the last one may be
-/// shorter) and encodes them concurrently across up to
-/// `available_parallelism()` OS threads, returning each block's
-/// `(encoded_bytes, written_bits)` in original order -- ready to feed
-/// straight into `write_framed_block` in a plain sequential loop.
-///
-/// Every block in this container format is fully self-contained: each
-/// `encode_blockN` call gets a fresh entropy-coder instance (TPAQ/CM/FPAQ
-/// all reset per block) and every transform either has no cross-block
-/// state at all or explicitly reinitializes it at the top of `forward()`
-/// (e.g. LzpCodec/LzxCodec's hash tables) -- exactly the property the
-/// real CLI's own `-j` concurrency already relies on for the identical
-/// wire format. So encoding blocks out of order is always safe; only the
-/// *output* order must be preserved, which this does by writing each
-/// result back into its original slot before the caller frames it.
-///
-/// `make_state` builds one thread-local scratch value per worker, created
-/// once and reused across every block that worker handles -- e.g. a
-/// `Bwt`'s internal buffers get reallocated only on growth, not per
-/// block, matching the reuse pattern the single-threaded loop used to get
-/// from sharing one instance across the whole call. `encode_one` encodes
-/// a single block given that worker's state.
-fn encode_blocks_parallel<S, F>(data: &[u8], block_size: u32, make_state: impl Fn() -> S + Sync, encode_one: F) -> Vec<(Vec<u8>, u64)>
-where
-    S: Send,
-    F: Fn(&mut S, &[u8]) -> (Vec<u8>, u64) + Sync,
-{
-    let mut ranges = Vec::new();
-    let mut offset = 0usize;
+/// Where an encoder's input blocks come from: borrowed slices of an in-memory
+/// buffer (no copy), or pooled buffers filled from a reader.
+trait BlockInput {
+    type Block: AsRef<[u8]> + Send;
 
-    while offset < data.len() {
-        let len = (block_size as usize).min(data.len() - offset);
-        ranges.push((offset, len));
-        offset += len;
-    }
+    fn next_block(&mut self, block_size: usize, pool: &BufPool) -> Result<Option<Self::Block>, String>;
 
-    if ranges.is_empty() {
-        return Vec::new();
-    }
+    fn recycle(block: Self::Block, pool: &BufPool);
+}
 
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(ranges.len());
-    let mut results: Vec<Option<(Vec<u8>, u64)>> = (0..ranges.len()).map(|_| None).collect();
+struct SliceInput<'a> {
+    data: &'a [u8],
+}
 
-    if workers <= 1 {
-        let mut state = make_state();
+impl<'a> BlockInput for SliceInput<'a> {
+    type Block = &'a [u8];
 
-        for (i, &(off, len)) in ranges.iter().enumerate() {
-            results[i] = Some(encode_one(&mut state, &data[off..off + len]));
+    fn next_block(&mut self, block_size: usize, _pool: &BufPool) -> Result<Option<&'a [u8]>, String> {
+        if self.data.is_empty() {
+            return Ok(None);
         }
-    } else {
-        std::thread::scope(|scope| {
-            let chunk = (ranges.len() + workers - 1) / workers;
-            let mut handles = Vec::new();
 
-            for start in (0..ranges.len()).step_by(chunk) {
-                let end = (start + chunk).min(ranges.len());
-                let ranges_ref = &ranges;
-                let make_state_ref = &make_state;
-                let encode_one_ref = &encode_one;
-
-                handles.push(scope.spawn(move || {
-                    let mut state = make_state_ref();
-                    let mut local = Vec::with_capacity(end - start);
-
-                    for i in start..end {
-                        let (off, len) = ranges_ref[i];
-                        local.push((i, encode_one_ref(&mut state, &data[off..off + len])));
-                    }
-
-                    local
-                }));
-            }
-
-            for h in handles {
-                for (i, res) in h.join().expect("encoder worker thread panicked") {
-                    results[i] = Some(res);
-                }
-            }
-        });
+        let (block, rest) = self.data.split_at(block_size.min(self.data.len()));
+        self.data = rest;
+        Ok(Some(block))
     }
 
-    results.into_iter().map(|r| r.expect("every block range was assigned to exactly one worker")).collect()
+    fn recycle(_block: &'a [u8], _pool: &BufPool) {}
+}
+
+struct ReadInput<R>(R);
+
+impl<R: std::io::Read> BlockInput for ReadInput<R> {
+    type Block = Vec<u8>;
+
+    fn next_block(&mut self, block_size: usize, pool: &BufPool) -> Result<Option<Vec<u8>>, String> {
+        use std::io::Read;
+
+        let mut block = pool.take_empty(block_size);
+        (&mut self.0)
+            .take(block_size as u64)
+            .read_to_end(&mut block)
+            .map_err(|e| format!("read error: {}", e))?;
+
+        if block.is_empty() {
+            pool.give(block);
+            return Ok(None);
+        }
+
+        Ok(Some(block))
+    }
+
+    fn recycle(block: Vec<u8>, pool: &BufPool) {
+        pool.give(block);
+    }
+}
+
+/// Encodes `input` block by block into a complete bitstream written to `out`,
+/// returning the number of bytes written. Every block in this format is fully
+/// self-contained: each `encode_blockN` call gets a fresh entropy coder
+/// (TPAQ/CM/FPAQ all reset per block) and every transform either has no
+/// cross-block state or reinitializes it at the top of `forward()` (e.g.
+/// LzpCodec/LzxCodec's hash tables) -- the property the reference CLI's own
+/// `-j` concurrency relies on for the same wire format. So blocks are encoded
+/// out of order on worker threads (`run_ordered`), each worker reusing one
+/// `make_state()` value across its blocks, and framed onto the output in
+/// order as they finish; only a bounded window of blocks is held at once.
+///
+/// The stream header carries no input-size hint, as before, so the output is
+/// byte-identical whether the input comes from memory or a reader.
+#[allow(clippy::too_many_arguments)]
+fn encode_stream<I: BlockInput, W: std::io::Write, S>(
+    mut input: I,
+    out: &mut W,
+    entropy_type: u64,
+    transform_type: u64,
+    block_size: u32,
+    hasher: &Hasher,
+    make_state: impl Fn() -> S + Sync,
+    encode_one: impl Fn(&mut S, &[u8]) -> (Vec<u8>, u64) + Sync,
+) -> Result<u64, String> {
+    let write_err = |e: std::io::Error| format!("write error: {}", e);
+    let pool = BufPool::new(BufPool::BUDGET);
+    let mut bw = BitWriter::new();
+    write_stream_header(&mut bw, entropy_type, transform_type, block_size, hasher);
+    let mut total = bw.drain_to(out).map_err(write_err)? as u64;
+
+    let workers = worker_count(usize::MAX).max(1);
+
+    run_ordered(
+        workers,
+        encode_window(workers, block_size),
+        make_state,
+        || input.next_block(block_size as usize, &pool),
+        |state, block: I::Block| {
+            let encoded = encode_one(state, block.as_ref());
+            I::recycle(block, &pool);
+            Ok(encoded)
+        },
+        |(bytes, written)| {
+            write_framed_block(&mut bw, &bytes, written);
+            pool.give(bytes);
+            total += bw.drain_to(out).map_err(write_err)? as u64;
+            Ok(())
+        },
+    )?;
+
+    // End marker: an empty (0-bit) block signals end of stream.
+    bw.write_bits(0, 5);
+    bw.write_bits(0, 3);
+    let tail = bw.finish();
+    out.write_all(&tail).map_err(write_err)?;
+    Ok(total + tail.len() as u64)
+}
+
+/// How many blocks an encode may have read but not yet written out. Unlike a
+/// decode, whose window only holds decoded output, an encode's window also
+/// holds a copy of each *input* block, so at the biggest block size (level 9
+/// uses 32 MiB) a flat `2 * workers` would hold half a GB of input. `2 *
+/// workers` is what the throughput actually wants -- at level 6, dropping to
+/// `workers + 1` cost 13% (3.1 -> 3.5 s on silesia.tar) for 11 MB -- so this
+/// only trims the window once the blocks themselves are large.
+fn encode_window(workers: usize, block_size: u32) -> usize {
+    const IN_FLIGHT_BUDGET: usize = 256 << 20;
+    (IN_FLIGHT_BUDGET / (block_size as usize).max(1)).clamp(workers + 1, 2 * workers)
+}
+
+/// Runs one of the `encode_level*_with` functions into a fresh `Vec`. Only a
+/// malformed argument (an invalid checksum size) can make it fail, which the
+/// in-memory API has always treated as a panic.
+fn encode_in_memory(encode: impl FnOnce(&mut Vec<u8>) -> Result<u64, String>) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode(&mut out).unwrap_or_else(|e| panic!("{}", e));
+    out
+}
+
+/// Encodes `input` at `level` (0-9) into a complete .knz bitstream written
+/// to `out`, returning the number of bytes written. Streams both ways: input
+/// is read one block at a time and output is written as blocks finish, so
+/// memory is bounded by the block size, not the input size. The output is
+/// byte-identical to `encode_level*` on the same bytes. `ck_size` selects the
+/// optional per-block checksum (0 = none, 1 = 32-bit, 2 = 64-bit).
+pub fn encode_to<R: std::io::Read, W: std::io::Write>(
+    input: R,
+    out: &mut W,
+    level: u32,
+    block_size: u32,
+    ck_size: u64,
+) -> Result<u64, String> {
+    let input = ReadInput(input);
+
+    match level {
+        0 => encode_level0_with(input, out, block_size, ck_size),
+        1 => encode_level1_with(input, out, block_size, ck_size),
+        2 => encode_level2_with(input, out, block_size, ck_size),
+        3 => encode_level3_with(input, out, block_size, ck_size),
+        4 => encode_level4_with(input, out, block_size, ck_size),
+        5 => encode_level5_with(input, out, block_size, ck_size),
+        6 => encode_level6_with(input, out, block_size, ck_size),
+        7 => encode_level7_with(input, out, block_size, ck_size),
+        8 => encode_level89_with(input, out, block_size, false, ck_size),
+        9 => encode_level89_with(input, out, block_size, true, ck_size),
+        _ => Err(format!("level must be 0-9, got {level}")),
+    }
 }
 
 /// Encodes `data` as a complete level-1 (LZX & NONE) kanzi bitstream:
@@ -246,48 +342,57 @@ where
 /// selects the optional per-block checksum (0=none, 1=32-bit, 2=64-bit --
 /// the real CLI's -x32/-x64).
 pub fn encode_level1(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
-    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
-    let mut bw = BitWriter::new();
+    encode_in_memory(|out| encode_level1_with(SliceInput { data }, out, block_size, ck_size))
+}
+
+fn encode_level1_with<I: BlockInput, W: std::io::Write>(
+    input: I,
+    out: &mut W,
+    block_size: u32,
+    ck_size: u64,
+) -> Result<u64, String> {
+    let hasher = Hasher::new(ck_size)?;
     let transform_type: u64 = LZX_TYPE << BFF_MAX_SHIFT;
-    write_stream_header(&mut bw, NONE_ENTROPY, transform_type, block_size, &hasher);
 
-    let blocks = encode_blocks_parallel(data, block_size, || LzxCodec::new(true), |lzx, block| {
-        encode_block(block, lzx, hasher.checksum(block))
-    });
-
-    for (encoded_block, written) in &blocks {
-        write_framed_block(&mut bw, encoded_block, *written);
-    }
-
-    // End marker: an empty (0-bit) block signals end of stream.
-    bw.write_bits(0, 5);
-    bw.write_bits(0, 3);
-
-    bw.finish()
+    encode_stream(
+        input,
+        out,
+        NONE_ENTROPY,
+        transform_type,
+        block_size,
+        &hasher,
+        || LzxCodec::new(true),
+        |lzx, block| encode_block(block, lzx, hasher.checksum(block)),
+    )
 }
 
 /// Encodes `data` as a complete level-2 (DNA+LZ & HUFFMAN) kanzi bitstream.
 /// The DNA/Alias stage is fully ported (see alias.rs), including the genuine
 /// nucleotide-input success path.
 pub fn encode_level2(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
-    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
-    let mut bw = BitWriter::new();
+    encode_in_memory(|out| encode_level2_with(SliceInput { data }, out, block_size, ck_size))
+}
+
+fn encode_level2_with<I: BlockInput, W: std::io::Write>(
+    input: I,
+    out: &mut W,
+    block_size: u32,
+    ck_size: u64,
+) -> Result<u64, String> {
+    let hasher = Hasher::new(ck_size)?;
     let transform_type: u64 =
         (DNA_TYPE << BFF_MAX_SHIFT) | (LZ_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT));
-    write_stream_header(&mut bw, HUFFMAN_ENTROPY, transform_type, block_size, &hasher);
 
-    let blocks = encode_blocks_parallel(data, block_size, || LzxCodec::new(false), |lzx, block| {
-        encode_block2(block, lzx, hasher.checksum(block))
-    });
-
-    for (encoded_block, written) in &blocks {
-        write_framed_block(&mut bw, encoded_block, *written);
-    }
-
-    bw.write_bits(0, 5);
-    bw.write_bits(0, 3);
-
-    bw.finish()
+    encode_stream(
+        input,
+        out,
+        HUFFMAN_ENTROPY,
+        transform_type,
+        block_size,
+        &hasher,
+        || LzxCodec::new(false),
+        |lzx, block| encode_block2(block, lzx, hasher.checksum(block)),
+    )
 }
 
 /// DNA/Alias stage (transform.AliasCodec, onlyDNA=true). Returns the
@@ -609,27 +714,32 @@ fn maybe_transformed_copy(
 /// Encodes `data` as a complete level-3 (TEXT+UTF+PACK+MM+LZX & HUFFMAN)
 /// kanzi bitstream. TEXT, UTF, PACK, MM/FSD and LZX are all fully ported.
 pub fn encode_level3(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
-    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
-    let mut bw = BitWriter::new();
+    encode_in_memory(|out| encode_level3_with(SliceInput { data }, out, block_size, ck_size))
+}
+
+fn encode_level3_with<I: BlockInput, W: std::io::Write>(
+    input: I,
+    out: &mut W,
+    block_size: u32,
+    ck_size: u64,
+) -> Result<u64, String> {
+    let hasher = Hasher::new(ck_size)?;
     let transform_type: u64 = (TEXT_TYPE << BFF_MAX_SHIFT)
         | (UTF_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT))
         | (PACK_TYPE << (BFF_MAX_SHIFT - 2 * BFF_ONE_SHIFT))
         | (MM_TYPE << (BFF_MAX_SHIFT - 3 * BFF_ONE_SHIFT))
         | (LZX_TYPE << (BFF_MAX_SHIFT - 4 * BFF_ONE_SHIFT));
-    write_stream_header(&mut bw, HUFFMAN_ENTROPY, transform_type, block_size, &hasher);
 
-    let blocks = encode_blocks_parallel(data, block_size, || LzxCodec::new(true), |lzx, block| {
-        encode_block3(block, lzx, block_size, hasher.checksum(block))
-    });
-
-    for (encoded_block, written) in &blocks {
-        write_framed_block(&mut bw, encoded_block, *written);
-    }
-
-    bw.write_bits(0, 5);
-    bw.write_bits(0, 3);
-
-    bw.finish()
+    encode_stream(
+        input,
+        out,
+        HUFFMAN_ENTROPY,
+        transform_type,
+        block_size,
+        &hasher,
+        || LzxCodec::new(true),
+        |lzx, block| encode_block3(block, lzx, block_size, hasher.checksum(block)),
+    )
 }
 
 fn encode_block3(data: &[u8], lzx: &mut LzxCodec, block_size: u32, checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
@@ -718,28 +828,34 @@ fn encode_block3(data: &[u8], lzx: &mut LzxCodec, block_size: u32, checksum: Opt
 /// (TEXT+UTF+EXE+PACK+MM+ROLZ & NONE) kanzi bitstream. TEXT, UTF, EXE, PACK,
 /// MM/FSD and ROLZ are all fully ported.
 pub fn encode_level4(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
-    let mut bw = BitWriter::new();
+    encode_in_memory(|out| encode_level4_with(SliceInput { data }, out, block_size, ck_size))
+}
+
+fn encode_level4_with<I: BlockInput, W: std::io::Write>(
+    input: I,
+    out: &mut W,
+    block_size: u32,
+    ck_size: u64,
+) -> Result<u64, String> {
     let transform_type: u64 = (TEXT_TYPE << BFF_MAX_SHIFT)
         | (UTF_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT))
         | (EXE_TYPE << (BFF_MAX_SHIFT - 2 * BFF_ONE_SHIFT))
         | (PACK_TYPE << (BFF_MAX_SHIFT - 3 * BFF_ONE_SHIFT))
         | (MM_TYPE << (BFF_MAX_SHIFT - 4 * BFF_ONE_SHIFT))
         | (ROLZ_TYPE << (BFF_MAX_SHIFT - 5 * BFF_ONE_SHIFT));
-    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
-    write_stream_header(&mut bw, NONE_ENTROPY, transform_type, block_size, &hasher);
+    let hasher = Hasher::new(ck_size)?;
 
-    let blocks = encode_blocks_parallel(data, block_size, RolzCodec::new, |rolz, block| {
+    encode_stream(
+        input,
+        out,
+        NONE_ENTROPY,
+        transform_type,
+        block_size,
+        &hasher,
+        RolzCodec::new, |rolz, block| {
         encode_block4(block, rolz, block_size, hasher.checksum(block))
-    });
-
-    for (encoded_block, written) in &blocks {
-        write_framed_block(&mut bw, encoded_block, *written);
-    }
-
-    bw.write_bits(0, 5);
-    bw.write_bits(0, 3);
-
-    bw.finish()
+    },
+    )
 }
 
 fn encode_block4(data: &[u8], rolz: &mut RolzCodec, block_size: u32, checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
@@ -838,27 +954,33 @@ fn encode_block4(data: &[u8], rolz: &mut RolzCodec, block_size: u32, checksum: O
 /// Encodes `data` as a complete level-5 (TEXT+UTF+BWT+RANK+ZRLT & ANS0)
 /// kanzi bitstream. All stages are fully ported.
 pub fn encode_level5(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
-    let mut bw = BitWriter::new();
+    encode_in_memory(|out| encode_level5_with(SliceInput { data }, out, block_size, ck_size))
+}
+
+fn encode_level5_with<I: BlockInput, W: std::io::Write>(
+    input: I,
+    out: &mut W,
+    block_size: u32,
+    ck_size: u64,
+) -> Result<u64, String> {
     let transform_type: u64 = (TEXT_TYPE << BFF_MAX_SHIFT)
         | (UTF_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT))
         | (BWT_TYPE << (BFF_MAX_SHIFT - 2 * BFF_ONE_SHIFT))
         | (RANK_TYPE << (BFF_MAX_SHIFT - 3 * BFF_ONE_SHIFT))
         | (ZRLT_TYPE << (BFF_MAX_SHIFT - 4 * BFF_ONE_SHIFT));
-    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
-    write_stream_header(&mut bw, ANS0_ENTROPY, transform_type, block_size, &hasher);
+    let hasher = Hasher::new(ck_size)?;
 
-    let blocks = encode_blocks_parallel(data, block_size, Bwt::new, |bwt, block| {
+    encode_stream(
+        input,
+        out,
+        ANS0_ENTROPY,
+        transform_type,
+        block_size,
+        &hasher,
+        Bwt::new, |bwt, block| {
         encode_block5(block, bwt, block_size, hasher.checksum(block))
-    });
-
-    for (encoded_block, written) in &blocks {
-        write_framed_block(&mut bw, encoded_block, *written);
-    }
-
-    bw.write_bits(0, 5);
-    bw.write_bits(0, 3);
-
-    bw.finish()
+    },
+    )
 }
 
 fn encode_block5(data: &[u8], bwt: &mut Bwt, block_size: u32, checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
@@ -946,27 +1068,33 @@ fn encode_block5(data: &[u8], bwt: &mut Bwt, block_size: u32, checksum: Option<(
 /// Encodes `data` as a complete level-6 (TEXT+UTF+BWT+SRT+ZRLT & FPAQ)
 /// kanzi bitstream. All stages are fully ported.
 pub fn encode_level6(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
-    let mut bw = BitWriter::new();
+    encode_in_memory(|out| encode_level6_with(SliceInput { data }, out, block_size, ck_size))
+}
+
+fn encode_level6_with<I: BlockInput, W: std::io::Write>(
+    input: I,
+    out: &mut W,
+    block_size: u32,
+    ck_size: u64,
+) -> Result<u64, String> {
     let transform_type: u64 = (TEXT_TYPE << BFF_MAX_SHIFT)
         | (UTF_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT))
         | (BWT_TYPE << (BFF_MAX_SHIFT - 2 * BFF_ONE_SHIFT))
         | (SRT_TYPE << (BFF_MAX_SHIFT - 3 * BFF_ONE_SHIFT))
         | (ZRLT_TYPE << (BFF_MAX_SHIFT - 4 * BFF_ONE_SHIFT));
-    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
-    write_stream_header(&mut bw, FPAQ_ENTROPY, transform_type, block_size, &hasher);
+    let hasher = Hasher::new(ck_size)?;
 
-    let blocks = encode_blocks_parallel(data, block_size, Bwt::new, |bwt, block| {
+    encode_stream(
+        input,
+        out,
+        FPAQ_ENTROPY,
+        transform_type,
+        block_size,
+        &hasher,
+        Bwt::new, |bwt, block| {
         encode_block6(block, bwt, block_size, hasher.checksum(block))
-    });
-
-    for (encoded_block, written) in &blocks {
-        write_framed_block(&mut bw, encoded_block, *written);
-    }
-
-    bw.write_bits(0, 5);
-    bw.write_bits(0, 3);
-
-    bw.finish()
+    },
+    )
 }
 
 fn encode_block6(data: &[u8], bwt: &mut Bwt, block_size: u32, checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
@@ -1068,22 +1196,27 @@ fn encode_block6(data: &[u8], bwt: &mut Bwt, block_size: u32, checksum: Option<(
 /// the raw payload alone, so Go's strict `<` re-emit rule always fires
 /// here (same reasoning as level 4's ROLZ-with-NONE-entropy path).
 pub fn encode_level0(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
-    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
-    let mut bw = BitWriter::new();
-    write_stream_header(&mut bw, NONE_ENTROPY, 0, block_size, &hasher);
+    encode_in_memory(|out| encode_level0_with(SliceInput { data }, out, block_size, ck_size))
+}
 
-    let blocks = encode_blocks_parallel(data, block_size, || (), |_state, block| {
-        encode_block0(block, hasher.checksum(block))
-    });
+fn encode_level0_with<I: BlockInput, W: std::io::Write>(
+    input: I,
+    out: &mut W,
+    block_size: u32,
+    ck_size: u64,
+) -> Result<u64, String> {
+    let hasher = Hasher::new(ck_size)?;
 
-    for (encoded_block, written) in &blocks {
-        write_framed_block(&mut bw, encoded_block, *written);
-    }
-
-    bw.write_bits(0, 5);
-    bw.write_bits(0, 3);
-
-    bw.finish()
+    encode_stream(
+        input,
+        out,
+        NONE_ENTROPY,
+        0,
+        block_size,
+        &hasher,
+        || (),
+        |_state, block| encode_block0(block, hasher.checksum(block)),
+    )
 }
 
 fn encode_block0(data: &[u8], checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
@@ -1093,9 +1226,11 @@ fn encode_block0(data: &[u8], checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
         return finish_block(data.to_vec(), block_len, true, 0, checksum);
     }
 
-    let skip_flags: u8 = 0x7F;
-    let normal = finish_block_multi((data.to_vec(), (block_len as u64) * 8), block_len, false, skip_flags, 1, checksum);
-    maybe_transformed_copy(normal, data, skip_flags, 1, checksum)
+    // NONE entropy: the normal block would be these same bytes plus a header,
+    // so Go's strict < rule always re-emits it in transformed-copy form --
+    // build that directly instead of assembling and discarding the normal
+    // one (two block-sized copies).
+    finish_block_transformed_copy(data, 0x7F, 1, checksum)
 }
 
 /// Encodes `data` as a complete level-7 (LZP+TEXT+UTF+BWT+LZP & CM)
@@ -1104,30 +1239,32 @@ fn encode_block0(data: &[u8], checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
 /// "fresh transform instance per slot" behavior even when the same type
 /// repeats.
 pub fn encode_level7(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
-    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
-    let mut bw = BitWriter::new();
+    encode_in_memory(|out| encode_level7_with(SliceInput { data }, out, block_size, ck_size))
+}
+
+fn encode_level7_with<I: BlockInput, W: std::io::Write>(
+    input: I,
+    out: &mut W,
+    block_size: u32,
+    ck_size: u64,
+) -> Result<u64, String> {
+    let hasher = Hasher::new(ck_size)?;
     let transform_type: u64 = (LZP_TYPE << BFF_MAX_SHIFT)
         | (TEXT_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT))
         | (UTF_TYPE << (BFF_MAX_SHIFT - 2 * BFF_ONE_SHIFT))
         | (BWT_TYPE << (BFF_MAX_SHIFT - 3 * BFF_ONE_SHIFT))
         | (LZP_TYPE << (BFF_MAX_SHIFT - 4 * BFF_ONE_SHIFT));
-    write_stream_header(&mut bw, CM_ENTROPY, transform_type, block_size, &hasher);
 
-    let blocks = encode_blocks_parallel(
-        data,
+    encode_stream(
+        input,
+        out,
+        CM_ENTROPY,
+        transform_type,
         block_size,
+        &hasher,
         || (LzpCodec::new(), Bwt::new(), LzpCodec::new()),
         |(lzp0, bwt, lzp1), block| encode_block7(block, lzp0, bwt, lzp1, block_size, hasher.checksum(block)),
-    );
-
-    for (encoded_block, written) in &blocks {
-        write_framed_block(&mut bw, encoded_block, *written);
-    }
-
-    bw.write_bits(0, 5);
-    bw.write_bits(0, 3);
-
-    bw.finish()
+    )
 }
 
 fn encode_block7(
@@ -1213,7 +1350,7 @@ fn encode_block7(
 /// Encodes `data` as a complete level-8 (EXE+RLT+TEXT+UTF+DNA & TPAQ)
 /// kanzi bitstream. All stages are fully ported.
 pub fn encode_level8(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
-    encode_level89(data, block_size, false, ck_size)
+    encode_in_memory(|out| encode_level89_with(SliceInput { data }, out, block_size, false, ck_size))
 }
 
 /// Encodes `data` as a complete level-9 (EXE+RLT+TEXT+UTF+DNA & TPAQX)
@@ -1221,32 +1358,34 @@ pub fn encode_level8(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
 /// entropy stage differs (TPAQX: a second SSE stage plus a 7th mixer
 /// input from an extra hashed context; see tpaq.rs).
 pub fn encode_level9(data: &[u8], block_size: u32, ck_size: u64) -> Vec<u8> {
-    encode_level89(data, block_size, true, ck_size)
+    encode_in_memory(|out| encode_level89_with(SliceInput { data }, out, block_size, true, ck_size))
 }
 
-fn encode_level89(data: &[u8], block_size: u32, extra: bool, ck_size: u64) -> Vec<u8> {
-    let hasher = Hasher::new(ck_size).expect("invalid ck_size");
-    let mut bw = BitWriter::new();
+fn encode_level89_with<I: BlockInput, W: std::io::Write>(
+    input: I,
+    out: &mut W,
+    block_size: u32,
+    extra: bool,
+    ck_size: u64,
+) -> Result<u64, String> {
+    let hasher = Hasher::new(ck_size)?;
     let transform_type: u64 = (EXE_TYPE << BFF_MAX_SHIFT)
         | (RLT_TYPE << (BFF_MAX_SHIFT - BFF_ONE_SHIFT))
         | (TEXT_TYPE << (BFF_MAX_SHIFT - 2 * BFF_ONE_SHIFT))
         | (UTF_TYPE << (BFF_MAX_SHIFT - 3 * BFF_ONE_SHIFT))
         | (DNA_TYPE << (BFF_MAX_SHIFT - 4 * BFF_ONE_SHIFT));
     let entropy_type = if extra { TPAQX_ENTROPY } else { TPAQ_ENTROPY };
-    write_stream_header(&mut bw, entropy_type, transform_type, block_size, &hasher);
 
-    let blocks = encode_blocks_parallel(data, block_size, || (), |_state, block| {
-        encode_block89(block, block_size, extra, hasher.checksum(block))
-    });
-
-    for (encoded_block, written) in &blocks {
-        write_framed_block(&mut bw, encoded_block, *written);
-    }
-
-    bw.write_bits(0, 5);
-    bw.write_bits(0, 3);
-
-    bw.finish()
+    encode_stream(
+        input,
+        out,
+        entropy_type,
+        transform_type,
+        block_size,
+        &hasher,
+        || (),
+        |_state, block| encode_block89(block, block_size, extra, hasher.checksum(block)),
+    )
 }
 
 fn encode_block89(data: &[u8], block_size: u32, extra: bool, checksum: Option<(u64, u8)>) -> (Vec<u8>, u64) {
@@ -1589,19 +1728,22 @@ fn read_block_header(
 
 /// Applies the known inverse-transform chain for one of the five
 /// transform_type combos this project's encoder produces. `buffer` is the
-/// entropy-decoded bytes (the output of the LAST forward transform).
-/// Returns the recovered original block bytes.
+/// entropy-decoded bytes (the output of the LAST forward transform); it is
+/// consumed, and freed as soon as the first inverse stage has read it, so a
+/// block never holds it alongside the later stages' buffers. Returns the
+/// recovered original block bytes.
 fn apply_inverse_transforms(
-    buffer: &[u8],
+    buffer: Vec<u8>,
     transform_type: u64,
     skip_flags: u8,
     block_size: u32,
     entropy_tpaqx: bool,
+    pool: &BufPool,
 ) -> Result<Vec<u8>, String> {
     if transform_type == 0 {
         // Level 0 (store): the one forced slot is NONE_TYPE, a pure
         // identity -- always a no-op regardless of skip_flags.
-        return Ok(buffer.to_vec());
+        return Ok(buffer);
     }
 
     let l1_type: u64 = LZX_TYPE << BFF_MAX_SHIFT;
@@ -1651,21 +1793,23 @@ fn apply_inverse_transforms(
         // slot0 = LZX. skip bit is the top bit of the (8-bit-wide, 1
         // transform) skip_flags byte.
         if skip_flags & 0x80 != 0 {
-            return Ok(buffer.to_vec());
+            return Ok(buffer);
         }
 
-        let mut dst = vec![0u8; dst_cap];
-        let (_, n) = LzxCodec::inverse(buffer, &mut dst).map_err(|e| e.to_string())?;
+        let mut dst = pool.take(dst_cap);
+        let (_, n) = LzxCodec::inverse(&buffer, &mut dst).map_err(|e| e.to_string())?;
+        pool.give(buffer);
         dst.truncate(n);
         Ok(dst)
     } else if transform_type == l2_type {
         // slot0 = DNA/Alias, slot1 = LZ. Inverse order is the reverse of
         // forward order: LZ first, then DNA/Alias (see alias.rs).
         let stage = if skip_flags & 0x40 != 0 {
-            buffer.to_vec()
+            buffer
         } else {
-            let mut dst = vec![0u8; dst_cap];
-            let (_, n) = LzxCodec::inverse(buffer, &mut dst).map_err(|e| e.to_string())?;
+            let mut dst = pool.take(dst_cap);
+            let (_, n) = LzxCodec::inverse(&buffer, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(buffer);
             dst.truncate(n);
             dst
         };
@@ -1674,8 +1818,9 @@ fn apply_inverse_transforms(
             return Ok(stage);
         }
 
-        let mut dst = vec![0u8; dst_cap];
+        let mut dst = pool.take(dst_cap);
         let (_, n) = alias::inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+        pool.give(stage);
         dst.truncate(n);
         Ok(dst)
     } else if transform_type == l3_type {
@@ -1693,10 +1838,11 @@ fn apply_inverse_transforms(
         let t0 = std::time::Instant::now();
 
         let stage = if skip_lzx {
-            buffer.to_vec()
+            buffer
         } else {
-            let mut dst = vec![0u8; dst_cap];
-            let (_, n) = LzxCodec::inverse(buffer, &mut dst).map_err(|e| e.to_string())?;
+            let mut dst = pool.take(dst_cap);
+            let (_, n) = LzxCodec::inverse(&buffer, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(buffer);
             dst.truncate(n);
             dst
         };
@@ -1706,8 +1852,9 @@ fn apply_inverse_transforms(
         let stage = if skip_mm {
             stage
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, n) = fsd::inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(stage);
             dst.truncate(n);
             dst
         };
@@ -1717,8 +1864,9 @@ fn apply_inverse_transforms(
         let stage = if skip_pack {
             stage
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, n) = alias::inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(stage);
             dst.truncate(n);
             dst
         };
@@ -1728,8 +1876,9 @@ fn apply_inverse_transforms(
         let stage = if skip_utf {
             stage
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, n) = utf::inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(stage);
             dst.truncate(n);
             dst
         };
@@ -1739,8 +1888,9 @@ fn apply_inverse_transforms(
         let result = if skip_text {
             Ok(stage)
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, back_len) = text_codec::inverse(&stage, &mut dst, block_size, false)?;
+            pool.give(stage);
             dst.truncate(back_len);
             Ok(dst)
         };
@@ -1771,11 +1921,12 @@ fn apply_inverse_transforms(
         let skip_text = skip_flags & 0x80 != 0;
 
         let stage = if skip_rolz {
-            buffer.to_vec()
+            buffer
         } else {
             let mut rolz = RolzCodec::new();
-            let mut dst = vec![0u8; dst_cap];
-            let (_, n) = rolz.inverse(buffer, &mut dst).map_err(|e| e.to_string())?;
+            let mut dst = pool.take(dst_cap);
+            let (_, n) = rolz.inverse(&buffer, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(buffer);
             dst.truncate(n);
             dst
         };
@@ -1783,8 +1934,9 @@ fn apply_inverse_transforms(
         let stage = if skip_mm {
             stage
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, n) = fsd::inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(stage);
             dst.truncate(n);
             dst
         };
@@ -1792,8 +1944,9 @@ fn apply_inverse_transforms(
         let stage = if skip_pack {
             stage
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, n) = alias::inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(stage);
             dst.truncate(n);
             dst
         };
@@ -1801,8 +1954,9 @@ fn apply_inverse_transforms(
         let stage = if skip_exe {
             stage
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, n) = exe::inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(stage);
             dst.truncate(n);
             dst
         };
@@ -1810,8 +1964,9 @@ fn apply_inverse_transforms(
         let stage = if skip_utf {
             stage
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, n) = utf::inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(stage);
             dst.truncate(n);
             dst
         };
@@ -1819,8 +1974,9 @@ fn apply_inverse_transforms(
         if skip_text {
             Ok(stage)
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, back_len) = text_codec::inverse(&stage, &mut dst, block_size, false)?;
+            pool.give(stage);
             dst.truncate(back_len);
             Ok(dst)
         }
@@ -1839,10 +1995,11 @@ fn apply_inverse_transforms(
         let t0 = std::time::Instant::now();
 
         let stage = if skip_zrlt {
-            buffer.to_vec()
+            buffer
         } else {
-            let mut dst = vec![0u8; dst_cap];
-            let (_, n) = zrlt::inverse(buffer, &mut dst).map_err(|e| e.to_string())?;
+            let mut dst = pool.take(dst_cap);
+            let (_, n) = zrlt::inverse(&buffer, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(buffer);
             dst.truncate(n);
             dst
         };
@@ -1854,8 +2011,9 @@ fn apply_inverse_transforms(
         let stage = if skip_rank {
             stage
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, n) = rank.inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(stage);
             dst.truncate(n);
             dst
         };
@@ -1865,11 +2023,10 @@ fn apply_inverse_transforms(
         let stage = if skip_bwt {
             stage
         } else {
-            let mut bwt = Bwt::new();
-            let mut dst = vec![0u8; dst_cap];
-            let (_, n) = bwt.inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
-            dst.truncate(n);
-            dst
+            // In place: BWT's inverse needs no separate output buffer.
+            let mut stage = stage;
+            Bwt::new().inverse_in_place(&mut stage).map_err(|e| e.to_string())?;
+            stage
         };
         let t_bwt = t2.elapsed();
 
@@ -1877,8 +2034,9 @@ fn apply_inverse_transforms(
         let stage = if skip_utf {
             stage
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, n) = utf::inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(stage);
             dst.truncate(n);
             dst
         };
@@ -1888,8 +2046,9 @@ fn apply_inverse_transforms(
         let result = if skip_text {
             Ok(stage)
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, back_len) = text_codec::inverse(&stage, &mut dst, block_size, false)?;
+            pool.give(stage);
             dst.truncate(back_len);
             Ok(dst)
         };
@@ -1919,10 +2078,11 @@ fn apply_inverse_transforms(
         let skip_text = skip_flags & 0x80 != 0;
 
         let stage = if skip_zrlt {
-            buffer.to_vec()
+            buffer
         } else {
-            let mut dst = vec![0u8; dst_cap];
-            let (_, n) = zrlt::inverse(buffer, &mut dst).map_err(|e| e.to_string())?;
+            let mut dst = pool.take(dst_cap);
+            let (_, n) = zrlt::inverse(&buffer, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(buffer);
             dst.truncate(n);
             dst
         };
@@ -1932,8 +2092,9 @@ fn apply_inverse_transforms(
         let stage = if skip_srt {
             stage
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, n) = srt.inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(stage);
             dst.truncate(n);
             dst
         };
@@ -1941,18 +2102,18 @@ fn apply_inverse_transforms(
         let stage = if skip_bwt {
             stage
         } else {
-            let mut bwt = Bwt::new();
-            let mut dst = vec![0u8; dst_cap];
-            let (_, n) = bwt.inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
-            dst.truncate(n);
-            dst
+            // In place: BWT's inverse needs no separate output buffer.
+            let mut stage = stage;
+            Bwt::new().inverse_in_place(&mut stage).map_err(|e| e.to_string())?;
+            stage
         };
 
         let stage = if skip_utf {
             stage
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, n) = utf::inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(stage);
             dst.truncate(n);
             dst
         };
@@ -1960,8 +2121,9 @@ fn apply_inverse_transforms(
         if skip_text {
             Ok(stage)
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, back_len) = text_codec1::inverse(&stage, &mut dst, block_size, false)?;
+            pool.give(stage);
             dst.truncate(back_len);
             Ok(dst)
         }
@@ -1981,11 +2143,12 @@ fn apply_inverse_transforms(
         let t0 = std::time::Instant::now();
 
         let stage = if skip_lzp1 {
-            buffer.to_vec()
+            buffer
         } else {
             let mut lzp1 = LzpCodec::new();
-            let mut dst = vec![0u8; dst_cap];
-            let (_, n) = lzp1.inverse(buffer, &mut dst).map_err(|e| e.to_string())?;
+            let mut dst = pool.take(dst_cap);
+            let (_, n) = lzp1.inverse(&buffer, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(buffer);
             dst.truncate(n);
             dst
         };
@@ -1995,11 +2158,10 @@ fn apply_inverse_transforms(
         let stage = if skip_bwt {
             stage
         } else {
-            let mut bwt = Bwt::new();
-            let mut dst = vec![0u8; dst_cap];
-            let (_, n) = bwt.inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
-            dst.truncate(n);
-            dst
+            // In place: BWT's inverse needs no separate output buffer.
+            let mut stage = stage;
+            Bwt::new().inverse_in_place(&mut stage).map_err(|e| e.to_string())?;
+            stage
         };
         let t_bwt = t1.elapsed();
 
@@ -2007,8 +2169,9 @@ fn apply_inverse_transforms(
         let stage = if skip_utf {
             stage
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, n) = utf::inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(stage);
             dst.truncate(n);
             dst
         };
@@ -2018,8 +2181,9 @@ fn apply_inverse_transforms(
         let stage = if skip_text {
             stage
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, back_len) = text_codec1::inverse(&stage, &mut dst, block_size, false)?;
+            pool.give(stage);
             dst.truncate(back_len);
             dst
         };
@@ -2030,8 +2194,9 @@ fn apply_inverse_transforms(
             Ok(stage)
         } else {
             let mut lzp0 = LzpCodec::new();
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, n) = lzp0.inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(stage);
             dst.truncate(n);
             Ok(dst)
         };
@@ -2063,10 +2228,11 @@ fn apply_inverse_transforms(
         let skip_exe = skip_flags & 0x80 != 0;
 
         let stage = if skip_dna {
-            buffer.to_vec()
+            buffer
         } else {
-            let mut dst = vec![0u8; dst_cap];
-            let (_, n) = alias::inverse(buffer, &mut dst).map_err(|e| e.to_string())?;
+            let mut dst = pool.take(dst_cap);
+            let (_, n) = alias::inverse(&buffer, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(buffer);
             dst.truncate(n);
             dst
         };
@@ -2074,8 +2240,9 @@ fn apply_inverse_transforms(
         let stage = if skip_utf {
             stage
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, n) = utf::inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(stage);
             dst.truncate(n);
             dst
         };
@@ -2083,8 +2250,9 @@ fn apply_inverse_transforms(
         let stage = if skip_text {
             stage
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, back_len) = text_codec1::inverse(&stage, &mut dst, block_size, entropy_tpaqx)?;
+            pool.give(stage);
             dst.truncate(back_len);
             dst
         };
@@ -2092,8 +2260,9 @@ fn apply_inverse_transforms(
         let stage = if skip_rlt {
             stage
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, n) = rlt::inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(stage);
             dst.truncate(n);
             dst
         };
@@ -2101,8 +2270,9 @@ fn apply_inverse_transforms(
         if skip_exe {
             Ok(stage)
         } else {
-            let mut dst = vec![0u8; dst_cap];
+            let mut dst = pool.take(dst_cap);
             let (_, n) = exe::inverse(&stage, &mut dst).map_err(|e| e.to_string())?;
+            pool.give(stage);
             dst.truncate(n);
             Ok(dst)
         }
@@ -2117,44 +2287,64 @@ fn apply_inverse_transforms(
     }
 }
 
-fn decode_block(
-    br: &mut BitReader,
-    written: u64,
-    hdr: &StreamHeader,
-    debug: bool,
-) -> Result<Vec<u8>, String> {
-    let block_header = read_block_header(br, written, hdr.transform_type)?;
-    let pre_len = block_header.pre_transform_length as usize;
+/// Decodes one framed block, consuming its compressed bytes: they are freed
+/// as soon as the entropy stage has produced the transform input, so a block
+/// in flight never holds its compressed bytes and its transform buffers at
+/// the same time.
+fn decode_block(block: FramedBlock, hdr: &StreamHeader, debug: bool, pool: &BufPool) -> Result<Vec<u8>, String> {
+    let (block_header, expected_checksum, payload) = {
+        let mut br = BitReader::at_bit_pos(&block.bytes, block.bit_off);
+        let br = &mut br;
+        let block_header = read_block_header(br, block.written, hdr.transform_type)?;
+        let pre_len = block_header.pre_transform_length as usize;
 
-    if debug {
-        eprintln!(
-            "DEBUG   raw_copy={} transformed_copy={} skip_flags={:#010b} pre_transform_length={} header_bits={}",
-            block_header.raw_copy, block_header.transformed_copy, block_header.skip_flags, pre_len, block_header.header_bits
-        );
-    }
+        if debug {
+            eprintln!(
+                "DEBUG   raw_copy={} transformed_copy={} skip_flags={:#010b} pre_transform_length={} header_bits={}",
+                block_header.raw_copy, block_header.transformed_copy, block_header.skip_flags, pre_len, block_header.header_bits
+            );
+        }
 
-    if pre_len == 0 || pre_len as u32 > hdr.block_size + hdr.block_size / 2 + 2048 {
-        return Err(format!("Invalid compressed block size: {}", pre_len));
-    }
+        if pre_len == 0 || pre_len as u32 > hdr.block_size + hdr.block_size / 2 + 2048 {
+            return Err(format!("Invalid compressed block size: {}", pre_len));
+        }
 
-    // The payload checksum (if any) sits right after the block header and
-    // before the payload, in every block shape (raw copy, transformed
-    // copy, and normal entropy-coded) -- see Go's "Extract checksum from
-    // bit stream" step, which runs unconditionally before dispatching on
-    // rawCopy/transformedCopy/normal.
-    let expected_checksum: Option<u64> = match &hdr.hasher {
-        Hasher::None => None,
-        Hasher::H32(_) => Some(br.read_bits(32)),
-        Hasher::H64(_) => Some(br.read_bits(64)),
+        // The payload checksum (if any) sits right after the block header and
+        // before the payload, in every block shape (raw copy, transformed
+        // copy, and normal entropy-coded) -- see Go's "Extract checksum from
+        // bit stream" step, which runs unconditionally before dispatching on
+        // rawCopy/transformedCopy/normal.
+        let expected_checksum: Option<u64> = match &hdr.hasher {
+            Hasher::None => None,
+            Hasher::H32(_) => Some(br.read_bits(32)),
+            Hasher::H64(_) => Some(br.read_bits(64)),
+        };
+
+        let payload = if block_header.raw_copy {
+            // No transform, no entropy: the payload is the final bytes as-is.
+            let mut payload = pool.take(pre_len);
+            br.read_array(&mut payload, 8 * pre_len);
+            payload
+        } else {
+            decode_block_entropy(br, &block_header, hdr, pre_len, pool)?
+        };
+
+        (block_header, expected_checksum, payload)
     };
 
+    pool.give(block.bytes);
+
     let decoded = if block_header.raw_copy {
-        // No transform, no entropy: the payload is the final bytes as-is.
-        let mut payload = vec![0u8; pre_len];
-        br.read_array(&mut payload, 8 * pre_len);
         payload
     } else {
-        decode_block_payload(br, &block_header, hdr, pre_len)?
+        apply_inverse_transforms(
+            payload,
+            hdr.transform_type,
+            block_header.skip_flags,
+            hdr.block_size,
+            hdr.entropy_type == TPAQX_ENTROPY,
+            pool,
+        )?
     };
 
     if let Some(expected) = expected_checksum {
@@ -2175,8 +2365,16 @@ fn decode_block(
     Ok(decoded)
 }
 
-fn decode_block_payload(br: &mut BitReader, block_header: &BlockHeader, hdr: &StreamHeader, pre_len: usize) -> Result<Vec<u8>, String> {
-    let mut buffer = vec![0u8; pre_len];
+/// Entropy-decodes a block's payload into the transform input (or copies it
+/// through for a transformed-copy block).
+fn decode_block_entropy(
+    br: &mut BitReader,
+    block_header: &BlockHeader,
+    hdr: &StreamHeader,
+    pre_len: usize,
+    pool: &BufPool,
+) -> Result<Vec<u8>, String> {
+    let mut buffer = pool.take(pre_len);
 
     let trace = std::env::var("DECTRACE").is_ok();
     let t_entropy0 = std::time::Instant::now();
@@ -2221,69 +2419,381 @@ fn decode_block_payload(br: &mut BitReader, block_header: &BlockHeader, hdr: &St
         eprintln!("DEC entropy(us): type={} t={}", hdr.entropy_type, t_entropy0.elapsed().as_micros());
     }
 
-    apply_inverse_transforms(
-        &buffer,
-        hdr.transform_type,
-        block_header.skip_flags,
-        hdr.block_size,
-        hdr.entropy_type == TPAQX_ENTROPY,
-    )
+    Ok(buffer)
 }
 
-/// Decodes a complete .knz bitstream (levels 1-6; see module doc).
-pub fn decode(data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut br = BitReader::new(data);
-    let hdr = read_stream_header(&mut br)?;
-    let debug = std::env::var("KDEBUG").is_ok();
+/// Output is written in pieces of at most this size. On Windows a single
+/// `WriteFile` of a multi-hundred-MB buffer goes 4-5x slower through the
+/// cache manager than the same bytes in block-sized writes (255-338 ms vs
+/// 57-73 ms for 212 MB on an i3-12100 / NVMe), and a block can be up to
+/// 1 GiB with an explicit block size.
+const WRITE_CHUNK: usize = 4 << 20;
 
-    // Phase 1: a cheap sequential pass that only *locates* each block --
-    // its bit position right after the length prefix, and its bit length
-    // -- without decoding any of its content. `skip_bits` is O(1), so this
-    // whole pass costs O(block count), not O(total bits), regardless of
-    // how large the blocks themselves are.
-    let mut spans: Vec<(usize, u64)> = Vec::new();
-    let mut block_id = 0;
+/// Recycles block-sized byte buffers for the duration of one encode or
+/// decode call.
+///
+/// Every block used to get fresh buffers -- its compressed bytes, the entropy
+/// output, one per inverse-transform stage, the decoded output -- and Windows
+/// serves and releases allocations this large straight from the OS, so every
+/// block page-faulted all of them in again: 90K faults decoding silesia.tar
+/// at level 1 on one thread, against kanzi-cpp's 4K, which reuses its
+/// buffers. Buffers go back here once superseded and are handed out again to
+/// any request they fit, up to four times its size -- within one stream the
+/// buffers are all the same order of magnitude, so a block-output buffer can
+/// also serve the next block's compressed bytes or entropy output.
+struct BufPool {
+    free: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// Upper bound on the capacity parked at once, in bytes.
+    budget: usize,
+}
 
-    loop {
-        let offset = br.bits_read();
-        let lw = (br.read_bits(5) as u32) + 3;
-        let written = br.read_bits(lw);
+impl BufPool {
+    /// Smaller buffers are served from the allocator's own free lists anyway.
+    const MIN_POOLED: usize = 256 * 1024;
 
-        if written == 0 {
-            break;
+    /// Parked-capacity budget for one encode or decode. Measured decoding
+    /// silesia.tar: 16 MiB
+    /// takes an L1 one-thread decode from 90K page faults to 6K and 296 to
+    /// 258 ms (L3: 720 -> 686 ms) for +3..7 MB peak; 8 MiB loses half of
+    /// that and 32 MiB gains nothing more. A budget rather than a buffer
+    /// count keeps 16 MiB blocks (levels 7-8) from parking two 18 MB
+    /// buffers for a <1% gain.
+    const BUDGET: usize = 16 << 20;
+
+    fn new(budget: usize) -> Self {
+        BufPool {
+            free: std::sync::Mutex::new(Vec::new()),
+            budget,
         }
-
-        block_id += 1;
-
-        if debug {
-            eprintln!(
-                "DEBUG block {} offset={} lw={} written={} written_bytes={}",
-                block_id,
-                offset,
-                lw,
-                written,
-                (written + 7) >> 3
-            );
-        }
-
-        spans.push((br.bits_read(), written));
-        br.skip_bits(written as usize);
     }
 
-    // Phase 2: every block is a fully self-contained framed unit -- its
-    // own header, checksum and entropy state, freshly (re)initialized on
-    // decode (see encode_blocks_parallel's doc comment for why) -- so once
-    // its bit range is known it can be decoded from an independent
-    // `BitReader` anchored at that offset, concurrently with every other
-    // block, mirroring the encode side's parallelism.
-    let decoded = decode_blocks_parallel(data, &spans, &hdr, debug)?;
-    let mut out = Vec::with_capacity(decoded.iter().map(|b| b.len()).sum());
+    /// An empty parked buffer with capacity in `cap..=4 * cap`, if any.
+    fn reuse(&self, cap: usize) -> Option<Vec<u8>> {
+        if cap < Self::MIN_POOLED {
+            return None;
+        }
 
-    for block in decoded {
+        let mut free = self.free.lock().unwrap();
+        let i = (0..free.len())
+            .filter(|&i| free[i].capacity() >= cap && free[i].capacity() <= 4 * cap)
+            .min_by_key(|&i| free[i].capacity())?;
+        let mut v = free.swap_remove(i);
+        v.clear();
+        Some(v)
+    }
+
+    /// A buffer of `len` zero bytes.
+    fn take(&self, len: usize) -> Vec<u8> {
+        match self.reuse(len) {
+            Some(mut v) => {
+                v.resize(len, 0);
+                v
+            }
+            None => vec![0u8; len],
+        }
+    }
+
+    /// An empty buffer with at least `cap` capacity.
+    fn take_empty(&self, cap: usize) -> Vec<u8> {
+        self.reuse(cap).unwrap_or_else(|| Vec::with_capacity(cap))
+    }
+
+    /// Parks `v` for reuse, within the byte budget: smaller parked buffers
+    /// are evicted to make room (larger ones serve every request a smaller
+    /// one could), and a buffer that still doesn't fit is simply freed.
+    fn give(&self, v: Vec<u8>) {
+        if v.capacity() < Self::MIN_POOLED || v.capacity() > self.budget {
+            return;
+        }
+
+        let mut evicted = Vec::new();
+        let mut free = self.free.lock().unwrap();
+        let mut parked: usize = free.iter().map(|b| b.capacity()).sum();
+
+        while parked + v.capacity() > self.budget {
+            let Some(i) = (0..free.len())
+                .filter(|&i| free[i].capacity() < v.capacity())
+                .min_by_key(|&i| free[i].capacity())
+            else {
+                return;
+            };
+
+            parked -= free[i].capacity();
+            evicted.push(free.swap_remove(i));
+        }
+
+        free.push(v);
+        drop(free);
+        drop(evicted);
+    }
+}
+
+/// Decodes a complete .knz bitstream held in memory. Prefer [`decode_to`]
+/// when the input is a file or the output goes to one: it never holds more
+/// than a few blocks at once.
+pub fn decode(data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut blocks: Vec<Vec<u8>> = Vec::new();
+
+    decode_with(data, None, |block| {
+        blocks.push(block);
+        Ok(None)
+    })?;
+
+    if blocks.len() == 1 {
+        return Ok(blocks.pop().unwrap());
+    }
+
+    let mut out = Vec::with_capacity(blocks.iter().map(|b| b.len()).sum());
+
+    for block in blocks {
         out.extend_from_slice(&block);
     }
 
     Ok(out)
+}
+
+/// Decodes a .knz bitstream from `input`, writing the original bytes to
+/// `out` in order as blocks finish, and returns the number of bytes written.
+///
+/// Both sides stream: `input` is read one framed block at a time and blocks
+/// are decoded in parallel, but only a small window of blocks (about two per
+/// worker thread) is buffered at any point, so memory is bounded by the
+/// stream's block size, not by the input or output size. Neither side is
+/// buffered further: input is pulled in pieces of 64 KiB or a whole block,
+/// output is written in pieces of up to 4 MiB, and `out` is not flushed.
+///
+/// On error, the blocks before the failing one have already been written.
+pub fn decode_to<R: std::io::Read, W: std::io::Write>(input: R, out: &mut W) -> Result<u64, String> {
+    let mut total = 0u64;
+
+    decode_with(input, None, |block| {
+        for chunk in block.chunks(WRITE_CHUNK) {
+            out.write_all(chunk).map_err(|e| format!("write error: {}", e))?;
+        }
+
+        total += block.len() as u64;
+        Ok(Some(block))
+    })?;
+
+    Ok(total)
+}
+
+/// Shared by [`decode`] and [`decode_to`]: reads the stream header, then
+/// hands each decoded block to `emit` in stream order. `emit` returns the
+/// block's buffer when it does not keep it, for reuse by later blocks.
+/// `jobs` pins the worker thread count (tests run the same stream
+/// sequentially and in parallel); `None` means `worker_count`.
+fn decode_with<R: std::io::Read>(
+    input: R,
+    jobs: Option<usize>,
+    mut emit: impl FnMut(Vec<u8>) -> Result<Option<Vec<u8>>, String>,
+) -> Result<(), String> {
+    let trace = std::env::var("DECTRACE").is_ok();
+    let t_fn = std::time::Instant::now();
+    let mut reader = BlockReader::new(input, std::env::var("KDEBUG").is_ok());
+    let hdr = reader.read_header()?;
+    let workers = jobs.unwrap_or_else(|| worker_count(usize::MAX)).max(1);
+    let pool = BufPool::new(BufPool::BUDGET);
+    let mut d_emit = std::time::Duration::ZERO;
+
+    decode_blocks_ordered(&mut reader, &hdr, workers, &pool, |block| {
+        let t = std::time::Instant::now();
+        let spare = emit(block);
+        d_emit += t.elapsed();
+
+        if let Some(buf) = spare? {
+            pool.give(buf);
+        }
+
+        Ok(())
+    })?;
+
+    if trace {
+        eprintln!(
+            "DEC total(us): read={} emit={} fn={}",
+            reader.read_time.as_micros(),
+            d_emit.as_micros(),
+            t_fn.elapsed().as_micros()
+        );
+    }
+
+    Ok(())
+}
+
+/// One framed block as read off the stream: its bytes, and where its bits
+/// start and how many there are. The first byte may carry trailing bits of
+/// the previous block's length prefix, hence `bit_off`.
+struct FramedBlock {
+    bytes: Vec<u8>,
+    bit_off: usize,
+    written: u64,
+}
+
+/// Pulls the stream header and then one framed block at a time out of a
+/// `Read`. Between blocks it holds only read-ahead for the next length
+/// prefix (at most 64 KiB); a block body is read straight into that block's
+/// own buffer.
+///
+/// Every block is a fully self-contained framed unit -- its own header,
+/// checksum and entropy state, freshly (re)initialized on decode (see
+/// encode_blocks_parallel's doc comment for why) -- so its bytes can be
+/// decoded independently of every other block, on any thread.
+struct BlockReader<R> {
+    input: R,
+    /// Read-ahead not yet consumed; `pos` is a bit offset into it.
+    buf: Vec<u8>,
+    pos: usize,
+    /// Stream bit offset of `buf[0]`, for `KDEBUG` output.
+    base_bits: u64,
+    eof: bool,
+    /// Largest acceptable framed block, from the stream header's block size.
+    max_block_bytes: u64,
+    blocks_read: usize,
+    debug: bool,
+    read_time: std::time::Duration,
+}
+
+impl<R: std::io::Read> BlockReader<R> {
+    const READ_AHEAD: usize = 64 * 1024;
+
+    fn new(input: R, debug: bool) -> Self {
+        BlockReader {
+            input,
+            buf: Vec::new(),
+            pos: 0,
+            base_bits: 0,
+            eof: false,
+            max_block_bytes: 0,
+            blocks_read: 0,
+            debug,
+            read_time: std::time::Duration::ZERO,
+        }
+    }
+
+    /// Reads until `buf` holds at least `bytes` bytes or the input ends.
+    fn fill_to(&mut self, bytes: usize) -> Result<(), String> {
+        while self.buf.len() < bytes && !self.eof {
+            let old = self.buf.len();
+            self.buf.resize(old + (bytes - old).max(Self::READ_AHEAD), 0);
+
+            match self.input.read(&mut self.buf[old..]) {
+                Ok(0) => {
+                    self.buf.truncate(old);
+                    self.eof = true;
+                }
+                Ok(n) => self.buf.truncate(old + n),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => self.buf.truncate(old),
+                Err(e) => {
+                    self.buf.truncate(old);
+                    return Err(format!("read error: {}", e));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn read_header(&mut self) -> Result<StreamHeader, String> {
+        // The header is at most 208 bits; a shorter input reads as zeros
+        // and fails the magic or header checksum check.
+        self.fill_to(64)?;
+        let mut br = BitReader::new(&self.buf);
+        let hdr = read_stream_header(&mut br)?;
+        self.pos = br.bits_read();
+
+        // Same bound as kanzi-cpp's CompressedInputStream: a block's
+        // pre-transform length is at most blockSize + blockSize/2 + 2048
+        // (checked again in decode_block), plus its header and checksum.
+        // Rejecting larger length prefixes up front keeps a corrupt or
+        // hostile prefix from forcing a huge allocation.
+        let bs = hdr.block_size as u64;
+        self.max_block_bytes = bs + bs / 2 + 2048 + 64;
+
+        Ok(hdr)
+    }
+
+    /// Reads the next framed block, or `None` at the end-of-stream marker.
+    fn next_block(&mut self, pool: &BufPool) -> Result<Option<FramedBlock>, String> {
+        let t = std::time::Instant::now();
+        let r = self.next_block_inner(pool);
+        self.read_time += t.elapsed();
+        r
+    }
+
+    fn next_block_inner(&mut self, pool: &BufPool) -> Result<Option<FramedBlock>, String> {
+        use std::io::Read;
+
+        // Length prefix: 5 bits of width, then 3..=34 bits of block length.
+        let offset = self.base_bits + self.pos as u64;
+        self.fill_to((self.pos + 39).div_ceil(8))?;
+        let mut br = BitReader::at_bit_pos(&self.buf, self.pos);
+        let lw = (br.read_bits(5) as u32) + 3;
+        let written = br.read_bits(lw);
+        let prefix_end = br.bits_read();
+
+        if prefix_end > self.buf.len() * 8 {
+            return Err("Truncated bitstream: missing block length or end-of-stream marker".to_string());
+        }
+
+        self.pos = prefix_end;
+
+        if written == 0 {
+            return Ok(None);
+        }
+
+        self.blocks_read += 1;
+
+        if self.debug {
+            eprintln!(
+                "DEBUG block {} offset={} lw={} written={} written_bytes={}",
+                self.blocks_read,
+                offset,
+                lw,
+                written,
+                written.div_ceil(8)
+            );
+        }
+
+        if written.div_ceil(8) > self.max_block_bytes {
+            return Err(format!("Invalid block size: {} bits", written));
+        }
+
+        let start = self.pos / 8;
+        let bit_off = self.pos % 8;
+        let end_bits = self.pos as u64 + written;
+        let total = end_bits.div_ceil(8) as usize - start;
+        let next_byte = (end_bits / 8) as usize;
+        let buffered_end = self.buf.len().min(start + total);
+
+        let mut bytes = pool.take_empty(total.min(64 << 20));
+        bytes.extend_from_slice(&self.buf[start..buffered_end]);
+
+        if bytes.len() < total {
+            // The body runs past the read-ahead: read the rest straight into
+            // this block's buffer. Everything buffered has now been consumed,
+            // except the block's last byte if the next length prefix starts
+            // inside it.
+            let missing = (total - bytes.len()) as u64;
+            (&mut self.input)
+                .take(missing)
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("read error: {}", e))?;
+
+            if bytes.len() < total {
+                return Err(format!("Truncated bitstream: block {} is incomplete", self.blocks_read));
+            }
+
+            self.buf.clear();
+            self.buf.extend_from_slice(&bytes[next_byte - start..]);
+        } else {
+            self.buf.drain(..next_byte);
+        }
+
+        self.base_bits += next_byte as u64 * 8;
+        self.pos = (end_bits % 8) as usize;
+
+        Ok(Some(FramedBlock { bytes, bit_off, written }))
+    }
 }
 
 /// Extracts a human-readable message from a caught panic payload (the
@@ -2299,116 +2809,213 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Decodes every block named in `spans` (each `(start_bit_pos,
-/// written_bits)`, as located by `decode`'s first pass) across up to
-/// `available_parallelism()` threads, returning them in original order.
-///
-/// Work-stealing, not a static contiguous split: every worker repeatedly
-/// claims the next unclaimed span index off one shared `AtomicUsize`
-/// cursor (`fetch_add` hands out a distinct index to each claimer, so no
-/// two workers ever process the same span) instead of being handed a
-/// fixed `[start, end)` range up front. Blocks vary in decode cost --
-/// content-dependent (BWT/entropy work scales with how compressible the
-/// data is, not just its byte length) and structurally (a trailing
-/// partial block is smaller by construction) -- so a static split can
-/// leave some workers idle while one is still grinding through an
-/// expensive block; work-stealing keeps every worker busy until the last
-/// span is claimed. See `BENCHMARKS.md`'s "decode thread pool" section
-/// for the measurement this replaced the static split on the strength of.
-///
-/// This project's decoders are already extensively hardened against
-/// panicking on corrupted input (see the BWT/ANS/TPAQ robustness audit),
-/// but every decoder here ultimately runs on untrusted bytes, so as a
-/// last line of defense any panic inside a worker thread is caught via
-/// `join()` (which a scoped-thread panic never propagates past on its
-/// own) and turned into the same kind of `Err` a clean validation failure
-/// would produce, rather than letting it take down the whole process --
-/// a `catch_unwind`-equivalent safety net that this parallel split gives
-/// us for free. Unlike the old static split, a panicking worker's
-/// in-flight claim isn't attributable to a known `[start, end)` range
-/// anymore, so instead every `results` slot still `None` after all
-/// workers have joined (whether it was mid-flight in the panicking
-/// worker or simply never reached) is backfilled with that panic's
-/// message -- `fetch_add`'s per-index uniqueness guarantees no slot is
-/// ever left `None` when no panic occurred, so this backfill only ever
-/// triggers in the panic case.
-fn decode_blocks_parallel(data: &[u8], spans: &[(usize, u64)], hdr: &StreamHeader, debug: bool) -> Result<Vec<Vec<u8>>, String> {
-    if spans.is_empty() {
-        return Ok(Vec::new());
-    }
+/// Work queue shared between the calling thread and `run_ordered`'s workers.
+struct JobQueue<J> {
+    jobs: std::collections::VecDeque<(usize, J)>,
+    /// No more jobs will be pushed; workers exit once the queue is empty.
+    closed: bool,
+    /// Give up now: workers exit without taking further jobs.
+    stop: bool,
+}
 
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(spans.len());
+/// Runs `work` over the jobs `next` produces, on `workers` threads, and hands
+/// the results to `emit` strictly in job order. `next` and `emit` run on the
+/// calling thread (they do the stream I/O); each worker only runs `work`,
+/// with its own `make_state()` reused across the jobs it takes. Shared by
+/// block decoding and block encoding.
+///
+/// Workers take jobs from a shared queue rather than a fixed split: block
+/// cost is content-dependent (BWT/entropy work scales with how compressible
+/// the data is, and a trailing partial block is smaller), so a static split
+/// leaves workers idle behind one expensive block. A job is only pulled once
+/// it is within `window` of the next one to emit, which bounds queued,
+/// in-flight and finished-but-unemitted jobs together -- this is what keeps
+/// streaming memory independent of stream size.
+///
+/// Errors come out in job order: once job `i` fails (in `next` or `work`),
+/// nothing past `i` is pulled or run, earlier jobs still finish and are
+/// emitted, and the error of the lowest failing index is returned.
+///
+/// Every decoder here runs on untrusted bytes and is hardened against
+/// panicking on corrupt input, but as a last line of defense a panic inside
+/// `work` is caught and turned into that job's `Err` (and that worker's
+/// state is rebuilt) -- which also guarantees every queued job produces a
+/// result, so the calling thread never waits on one whose worker died.
+fn run_ordered<J: Send, O: Send, S>(
+    workers: usize,
+    window: usize,
+    make_state: impl Fn() -> S + Sync,
+    mut next: impl FnMut() -> Result<Option<J>, String>,
+    work: impl Fn(&mut S, J) -> Result<O, String> + Sync,
+    mut emit: impl FnMut(O) -> Result<(), String>,
+) -> Result<(), String> {
+    use std::collections::BTreeMap;
+    use std::sync::{mpsc, Condvar, Mutex};
+
+    let run_one = |state: &mut S, job: J| -> Result<O, String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(state, job))).unwrap_or_else(|payload| {
+            *state = make_state();
+            Err(format!("worker thread panicked: {}", panic_message(payload.as_ref())))
+        })
+    };
 
     if workers <= 1 {
-        return spans
-            .iter()
-            .map(|&(pos, written)| {
-                let mut local = BitReader::at_bit_pos(data, pos);
-                decode_block(&mut local, written, hdr, debug)
-            })
-            .collect();
+        let mut state = make_state();
+
+        while let Some(job) = next()? {
+            emit(run_one(&mut state, job)?)?;
+        }
+
+        return Ok(());
     }
 
-    let mut results: Vec<Option<Result<Vec<u8>, String>>> = (0..spans.len()).map(|_| None).collect();
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut panic_msg: Option<String> = None;
+    // Don't start threads for a single-job stream (the common case for
+    // small in-memory inputs).
+    let Some(first) = next()? else {
+        return Ok(());
+    };
+
+    let second = match next() {
+        Ok(Some(job)) => job,
+        Ok(None) => return emit(run_one(&mut make_state(), first)?),
+        Err(e) => {
+            emit(run_one(&mut make_state(), first)?)?;
+            return Err(e);
+        }
+    };
+
+    let queue = Mutex::new(JobQueue {
+        jobs: std::collections::VecDeque::from([(0, first), (1, second)]),
+        closed: false,
+        stop: false,
+    });
+    let ready = Condvar::new();
+    let (tx, rx) = mpsc::channel::<(usize, Result<O, String>)>();
 
     std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(workers);
-
         for _ in 0..workers {
-            let next_ref = &next;
+            let tx = tx.clone();
+            let (queue, ready, run_one, make_state) = (&queue, &ready, &run_one, &make_state);
 
-            handles.push(scope.spawn(move || {
-                let mut local = Vec::new();
+            scope.spawn(move || {
+                let mut state = make_state();
 
                 loop {
-                    let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let job = {
+                        let mut q = queue.lock().unwrap();
 
-                    if i >= spans.len() {
+                        loop {
+                            if q.stop {
+                                break None;
+                            }
+
+                            if let Some(job) = q.jobs.pop_front() {
+                                break Some(job);
+                            }
+
+                            if q.closed {
+                                break None;
+                            }
+
+                            q = ready.wait(q).unwrap();
+                        }
+                    };
+
+                    let Some((i, job)) = job else { break };
+                    let res = run_one(&mut state, job);
+
+                    if tx.send((i, res)).is_err() {
                         break;
                     }
-
-                    let (pos, written) = spans[i];
-                    let mut br = BitReader::at_bit_pos(data, pos);
-                    local.push((i, decode_block(&mut br, written, hdr, debug)));
                 }
-
-                local
-            }));
+            });
         }
 
-        for handle in handles {
-            match handle.join() {
-                Ok(items) => {
-                    for (i, res) in items {
-                        results[i] = Some(res);
+        drop(tx);
+        ready.notify_all();
+
+        let mut pending: BTreeMap<usize, Result<O, String>> = BTreeMap::new();
+        let mut next_index = 2;
+        let mut emitted = 0;
+        let mut fail_at = usize::MAX;
+        let mut end_reached = false;
+
+        let result = loop {
+            while !end_reached && next_index < fail_at && next_index < emitted + window {
+                match next() {
+                    Ok(Some(job)) => {
+                        queue.lock().unwrap().jobs.push_back((next_index, job));
+                        ready.notify_one();
+                    }
+                    Ok(None) => end_reached = true,
+                    Err(e) => {
+                        pending.insert(next_index, Err(e));
+                        fail_at = next_index;
+                        end_reached = true;
                     }
                 }
-                Err(payload) => {
-                    if panic_msg.is_none() {
-                        panic_msg = Some(panic_message(payload.as_ref()));
-                    }
+
+                if !end_reached || fail_at == next_index {
+                    next_index += 1;
                 }
             }
-        }
-    });
 
-    if let Some(msg) = &panic_msg {
-        for r in results.iter_mut() {
-            if r.is_none() {
-                *r = Some(Err(format!("decoder worker thread panicked: {}", msg)));
+            if end_reached {
+                queue.lock().unwrap().closed = true;
+                ready.notify_all();
             }
-        }
-    }
 
-    results
-        .into_iter()
-        .map(|r| r.expect("every block span was claimed exactly once or backfilled after a panic"))
-        .collect()
+            if let Some(res) = pending.remove(&emitted) {
+                match res.and_then(&mut emit) {
+                    Ok(()) => {
+                        emitted += 1;
+                        continue;
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+
+            if end_reached && emitted == next_index {
+                break Ok(());
+            }
+
+            let Ok((i, res)) = rx.recv() else {
+                break Err("workers stopped before every block was processed".to_string());
+            };
+
+            if res.is_err() && i < fail_at {
+                fail_at = i;
+                queue.lock().unwrap().jobs.retain(|(j, _)| *j < i);
+            }
+
+            pending.insert(i, res);
+        };
+
+        queue.lock().unwrap().stop = true;
+        ready.notify_all();
+        result
+    })
+}
+
+/// Reads blocks from `reader`, decodes them on `workers` threads (see
+/// `run_ordered`) and passes the results to `emit` in stream order.
+fn decode_blocks_ordered<R: std::io::Read>(
+    reader: &mut BlockReader<R>,
+    hdr: &StreamHeader,
+    workers: usize,
+    pool: &BufPool,
+    emit: impl FnMut(Vec<u8>) -> Result<(), String>,
+) -> Result<(), String> {
+    let debug = reader.debug;
+
+    run_ordered(
+        workers,
+        2 * workers,
+        || (),
+        || reader.next_block(pool),
+        |_, block| decode_block(block, hdr, debug, pool),
+        emit,
+    )
 }
 
 /// Encodes one block's local (byte-aligned) buffer:
@@ -2430,10 +3037,10 @@ fn encode_block(data: &[u8], lzx: &mut LzxCodec, checksum: Option<(u64, u8)>) ->
     };
 
     let skip_flags = (skip_bit << 7) | 0x7F;
-    let normal = finish_block_multi((payload.clone(), payload.len() as u64 * 8), payload.len(), false, skip_flags, 1, checksum);
     // With NONE entropy the entropy stage never shrinks the payload, so Go
-    // always re-emits such blocks in transformed-copy form (strict < rule).
-    maybe_transformed_copy(normal, &payload, skip_flags, 1, checksum)
+    // always re-emits such blocks in transformed-copy form (strict < rule) --
+    // build that directly instead of assembling and discarding the normal one.
+    finish_block_transformed_copy(&payload, skip_flags, 1, checksum)
 }
 
 #[cfg(test)]
@@ -2497,7 +3104,7 @@ mod tests {
     #[test]
     fn roundtrip_readme() {
         // This project's own README as a real, non-synthetic text sample.
-        assert_roundtrips_all_levels(include_bytes!("../README.md"));
+        assert_roundtrips_all_levels(include_bytes!("../../../README.md"));
     }
 
     #[test]
@@ -2507,7 +3114,7 @@ mod tests {
         // ("range end index N out of range for slice of length N-1") when
         // the last match in a block left fewer than 4 bytes after m_idx.
         // Found via examples/benchmark.py on this exact file at level 3.
-        assert_roundtrips_all_levels(include_bytes!("../README.md"));
+        assert_roundtrips_all_levels(include_bytes!("../../../README.md"));
     }
 
     #[test]
@@ -2562,5 +3169,261 @@ mod tests {
         }
 
         assert_roundtrips_all_levels(text.as_bytes());
+    }
+
+    #[test]
+    fn buf_pool_reuses_within_budget() {
+        const M: usize = 1 << 20;
+        let pool = BufPool::new(16 * M);
+
+        // Fresh buffers are zeroed; small requests bypass the pool entirely.
+        assert!(pool.take(4 * M).iter().all(|&b| b == 0));
+        pool.give(vec![7u8; 1024]);
+        assert!(pool.free.lock().unwrap().is_empty());
+
+        // A parked buffer comes back zeroed, to any request it fits up to 4x.
+        let mut a = pool.take(4 * M);
+        a.fill(9);
+        let a_ptr = a.as_ptr();
+        pool.give(a);
+        let b = pool.take(2 * M);
+        assert_eq!(b.as_ptr(), a_ptr, "buffer was not reused");
+        assert!(b.len() == 2 * M && b.iter().all(|&x| x == 0));
+        pool.give(b);
+        assert!(pool.take_empty(M / 2).capacity() < 4 * M, "a 4 MiB buffer must not serve a 512 KiB request");
+
+        // The budget holds; smaller parked buffers make way for larger ones.
+        pool.give(vec![0u8; 6 * M]);
+        pool.give(vec![0u8; 10 * M]);
+        let parked = |p: &BufPool| p.free.lock().unwrap().iter().map(|v| v.capacity()).sum::<usize>();
+        assert!(parked(&pool) <= 16 * M);
+        pool.give(vec![0u8; 12 * M]);
+        assert!(parked(&pool) <= 16 * M);
+        assert!(pool.free.lock().unwrap().iter().any(|v| v.capacity() >= 12 * M), "larger buffer should evict smaller ones");
+        pool.give(vec![0u8; 17 * M]);
+        assert!(pool.free.lock().unwrap().iter().all(|v| v.capacity() < 17 * M), "over-budget buffer must not be parked");
+    }
+
+    /// Hands out at most `chunk` bytes per `read`, so block bodies and
+    /// length prefixes straddle read boundaries at arbitrary bit offsets.
+    struct ChunkedReader<'a> {
+        data: &'a [u8],
+        chunk: usize,
+    }
+
+    impl std::io::Read for ChunkedReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.chunk.min(buf.len()).min(self.data.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    /// Text-like content that compresses, so blocks vary in encoded size.
+    fn text_like(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        let words: [&[u8]; 8] = [b"alpha ", b"beta ", b"gamma ", b"delta\n", b"kanzi ", b"block ", b"stream ", b"42 "];
+        let mut data = Vec::with_capacity(len + 8);
+
+        while data.len() < len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            data.extend_from_slice(words[(state % 8) as usize]);
+        }
+
+        data.truncate(len);
+        data
+    }
+
+    /// Runs the streaming decoder with a pinned thread count, returning
+    /// everything emitted and the final result.
+    fn decode_streaming(input: impl std::io::Read, jobs: usize) -> (Vec<u8>, Result<(), String>) {
+        let mut out = Vec::new();
+        let res = decode_with(input, Some(jobs), |block| {
+            out.extend_from_slice(&block);
+            Ok(Some(block))
+        });
+        (out, res)
+    }
+
+    #[test]
+    fn streaming_decode_many_blocks_any_jobs_any_read_size() {
+        // 1 KiB blocks: ~300 blocks, far more than the 2 * workers window,
+        // so the read-ahead bound and out-of-order completion are exercised.
+        let data = text_like(300_000, 0x5eed_0001);
+
+        for (level, encode) in [(1, encode_level1 as fn(&[u8], u32, u64) -> Vec<u8>), (3, encode_level3), (6, encode_level6)] {
+            let encoded = encode(&data, 1024, 1);
+
+            for jobs in [1, 2, 8] {
+                for chunk in [7, 4096, usize::MAX] {
+                    let (out, res) = decode_streaming(ChunkedReader { data: &encoded, chunk }, jobs);
+                    res.unwrap_or_else(|e| panic!("level {level} jobs {jobs} chunk {chunk}: {e}"));
+                    assert!(out == data, "level {level} jobs {jobs} chunk {chunk}: output mismatch");
+                }
+            }
+
+            let mut sink = Vec::new();
+            assert_eq!(decode_to(encoded.as_slice(), &mut sink).unwrap(), data.len() as u64);
+            assert!(sink == data, "level {level}: decode_to mismatch");
+            assert!(decode(&encoded).unwrap() == data, "level {level}: decode mismatch");
+        }
+    }
+
+    #[test]
+    fn streaming_decode_errors_in_stream_order_regardless_of_jobs() {
+        let data = text_like(200_000, 0x5eed_0002);
+        let encoded = encode_level1(&data, 1024, 1);
+
+        // Corrupt two spots; with per-block XXH32 checksums both are
+        // detected, and every thread count must report the earlier one and
+        // emit exactly the blocks before it.
+        for spots in [[0.35, 0.70], [0.70, 0.35], [0.50, 0.51]] {
+            let mut corrupt = encoded.clone();
+
+            for f in spots {
+                let at = (corrupt.len() as f64 * f) as usize;
+                corrupt[at] ^= 0x5A;
+            }
+
+            let (out1, res1) = decode_streaming(corrupt.as_slice(), 1);
+            let err1 = res1.expect_err("corruption must be detected");
+            assert!(data.starts_with(&out1), "emitted output must be a prefix of the original");
+
+            for jobs in [2, 8] {
+                let (out, res) = decode_streaming(ChunkedReader { data: &corrupt, chunk: 777 }, jobs);
+                assert_eq!(res, Err(err1.clone()), "jobs {jobs}: different error than sequential decode");
+                assert!(out == out1, "jobs {jobs}: different emitted prefix than sequential decode");
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_decode_truncated_input_is_an_error() {
+        let data = text_like(100_000, 0x5eed_0003);
+        let encoded = encode_level1(&data, 1024, 0);
+
+        for cut in [encoded.len() - 1, encoded.len() * 3 / 5, 40] {
+            for jobs in [1, 8] {
+                let (out, res) = decode_streaming(&encoded[..cut], jobs);
+                assert!(res.is_err(), "cut at {cut}, jobs {jobs}: truncation not reported");
+                assert!(data.starts_with(&out), "cut at {cut}, jobs {jobs}: emitted output not a prefix");
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_decode_stops_on_write_error() {
+        struct FailingWriter {
+            left: usize,
+        }
+
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.left == 0 {
+                    return Err(std::io::Error::other("disk full"));
+                }
+
+                let n = buf.len().min(self.left);
+                self.left -= n;
+                Ok(n)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let data = text_like(200_000, 0x5eed_0004);
+        let encoded = encode_level3(&data, 1024, 0);
+        let err = decode_to(encoded.as_slice(), &mut FailingWriter { left: 50_000 }).unwrap_err();
+        assert!(err.contains("disk full"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn streaming_decode_reads_ahead_only_a_bounded_window() {
+        struct CountingReader<'a> {
+            data: &'a [u8],
+            read: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+
+        impl std::io::Read for CountingReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(self.data.len());
+                buf[..n].copy_from_slice(&self.data[..n]);
+                self.data = &self.data[n..];
+                self.read.set(self.read.get() + n);
+                Ok(n)
+            }
+        }
+
+        // Incompressible 256 KiB blocks, larger than the reader's 64 KiB
+        // read-ahead, so input consumed tracks blocks read.
+        let block = 256 * 1024;
+        let mut state = 0x5eed_0005u64;
+        let data: Vec<u8> = (0..32 * block)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        let encoded = encode_level1(&data, block as u32, 0);
+
+        for jobs in [1, 2, 4] {
+            let read = std::rc::Rc::new(std::cell::Cell::new(0));
+            let window = if jobs == 1 { 1 } else { 2 * jobs };
+            let mut emitted = 0;
+            let mut out = Vec::new();
+
+            decode_with(CountingReader { data: &encoded, read: read.clone() }, Some(jobs), |b| {
+                emitted += 1;
+                let bound = (emitted + window + 1) * (block + 4096) + BlockReader::<&[u8]>::READ_AHEAD;
+                assert!(
+                    read.get() <= bound,
+                    "jobs {jobs}: {} bytes read by block {emitted}, bound {bound}",
+                    read.get()
+                );
+                out.extend_from_slice(&b);
+                Ok(Some(b))
+            })
+            .unwrap();
+
+            assert!(out == data);
+        }
+    }
+
+    #[test]
+    fn streaming_decode_rejects_oversized_block_length_prefix() {
+        // A valid header followed by a length prefix claiming a block far
+        // larger than the header's block size allows must be rejected
+        // before any attempt to allocate or read that much.
+        let encoded = encode_level1(b"hello", 1024, 0);
+        let mut reader = BlockReader::new(encoded.as_slice(), false);
+        reader.read_header().unwrap();
+        let header_bits = reader.pos;
+
+        let mut bw = BitWriter::new();
+        let mut br = BitReader::new(&encoded);
+        let mut left = header_bits;
+
+        while left > 0 {
+            let n = left.min(32);
+            bw.write_bits(br.read_bits(n as u32), n as u32);
+            left -= n;
+        }
+
+        bw.write_bits(34 - 3, 5);
+        bw.write_bits(1 << 33, 34);
+        let forged = bw.finish();
+
+        for jobs in [1, 8] {
+            let (_, res) = decode_streaming(forged.as_slice(), jobs);
+            let err = res.expect_err("oversized block must be rejected");
+            assert!(err.contains("Invalid block size"), "unexpected error: {err}");
+        }
     }
 }

@@ -55,7 +55,7 @@ def real_datasets(rust_root: pathlib.Path) -> list[tuple[str, bytes]]:
     if readme.exists():
         datasets.append(("project README (real English prose)", readme.read_bytes()))
 
-    rs_files = sorted(rust_root.glob("src/*.rs"))
+    rs_files = sorted(rust_root.glob("crates/kanzi/src/*.rs"))
     if rs_files:
         blob = b"".join(p.read_bytes() for p in rs_files)
         datasets.append((f"this project's Rust source ({len(rs_files)} real files)", blob))
@@ -127,7 +127,7 @@ def main() -> None:
     if args:
         datasets = [(pathlib.Path(p).name, pathlib.Path(p).read_bytes()) for p in args]
     else:
-        rust_root = pathlib.Path(__file__).resolve().parent.parent
+        rust_root = pathlib.Path(__file__).resolve().parents[3]
         datasets = real_datasets(rust_root)
 
     all_ok = True

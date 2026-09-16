@@ -3035,7 +3035,7 @@ mod tests {
         // A real, non-synthetic, moderately large input (this crate's own
         // README), the kind of thing container.rs's own tests already use
         // as a round-trip fixture.
-        let text = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+        let text = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"))
             .expect("README.md should exist");
         check_matches_sais(&text);
     }
@@ -3050,7 +3050,7 @@ mod tests {
     #[test]
     #[ignore]
     fn large_real_files_vs_sais() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/verify");
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../verify");
 
         for name in ["text_8mb.bin", "dna.bin", "base64_8mb.bin", "repeat_8mb.bin", "kanzi.exe"] {
             let path = format!("{dir}/{name}");
