@@ -656,18 +656,21 @@ impl AnsEncoder {
 
 // --- decoder ---
 
+/// 16-bit fields, like kanzi-cpp's ANSDecSymbol: both quantities are bounded by
+/// the frequency scale (2^log_range <= 32768), and the small entry keeps the
+/// order-1 table (65536 entries) at 256 KiB instead of 1 MiB.
 #[derive(Clone, Copy)]
 struct DecSymbol {
-    cum_freq: i64,
-    freq: i64,
+    cum_freq: u16,
+    freq: u16,
 }
 
 impl DecSymbol {
     fn reset(&mut self, cum_freq: i64, mut freq: i64, log_range: u32) {
         // Mirror encoder
         freq = freq.min((1 << log_range) - 1);
-        self.cum_freq = cum_freq;
-        self.freq = freq;
+        self.cum_freq = cum_freq as u16;
+        self.freq = freq as u16;
     }
 }
 
@@ -679,6 +682,39 @@ pub struct AnsDecoder {
     chunk_size: usize,
     log_range: u32,
     order: u32,
+}
+
+/// The eight buffer bytes a group of four interleaved states may consume.
+#[inline(always)]
+fn window8(buffer: &[u8], n: usize) -> Option<&[u8; 8]> {
+    buffer.get(n..n + 8)?.try_into().ok()
+}
+
+/// One ANS decoding step, D(x) = (s, q_s (x/M) + mod(x,M) - b_s), followed by a
+/// branchless renormalization: kanzi-cpp always reads the next two bytes and
+/// folds them in under a 0/-1 mask rather than branching on the state, which
+/// the state-dependent `if` here used to mispredict on every other symbol.
+/// `k` is the offset into the group's byte window; it stays <= 6 at every read
+/// (four symbols, two bytes each at most), so masking it keeps both indices in
+/// range without a bounds check.
+#[inline(always)]
+fn decode_symbol(
+    st: u32,
+    sym: DecSymbol,
+    log_range: u32,
+    mask: u32,
+    w: &[u8; 8],
+    k: usize,
+) -> (u32, usize) {
+    let st = (sym.freq as u32)
+        .wrapping_mul(st >> log_range)
+        .wrapping_add(st & mask)
+        .wrapping_sub(sym.cum_freq as u32);
+    debug_assert!(k <= 6, "the fourth symbol of a group reads at most w[6..8]");
+    let x = if st < ANS_TOP as u32 { u32::MAX } else { 0 };
+    let next = ((w[k & 7] as u32) << 8) | w[(k + 1) & 7] as u32;
+
+    ((st << (x & 16)) | (x & next), k + (x & 2) as usize)
 }
 
 impl AnsDecoder {
@@ -702,13 +738,7 @@ impl AnsDecoder {
         let dim = (255 * order + 1) as usize;
         Ok(AnsDecoder {
             freqs: vec![0i64; dim * 256],
-            symbols: vec![
-                DecSymbol {
-                    cum_freq: 0,
-                    freq: 0
-                };
-                dim * 256
-            ],
+            symbols: vec![DecSymbol { cum_freq: 0, freq: 0 }; dim * 256],
             f2s: Vec::new(),
             buffer: Vec::new(),
             chunk_size: chk,
@@ -895,30 +925,6 @@ impl AnsDecoder {
         Ok(start_chunk)
     }
 
-    fn decode_symbol(
-        &mut self,
-        mut n: usize,
-        mut st: i64,
-        sym: DecSymbol,
-        mask: i64,
-    ) -> (usize, i64) {
-        // Compute next ANS state
-        // D(x) = (s, q_s (x/M) + mod(x,M) - b_s)
-        st = sym
-            .freq
-            .wrapping_mul(st >> self.log_range)
-            .wrapping_add(st & mask)
-            .wrapping_sub(sym.cum_freq);
-
-        // Normalize
-        if st < ANS_TOP {
-            st = (st << 16) | ((self.buffer[n] as i64) << 8) | self.buffer[n + 1] as i64;
-            n += 2;
-        }
-
-        (n, st)
-    }
-
     fn decode_chunk_v2(&mut self, br: &mut BitReader, block: &mut [u8]) -> bool {
         // Read chunk size
         let sz = read_var_int(br) as usize;
@@ -928,10 +934,10 @@ impl AnsDecoder {
         }
 
         // Read initial ANS state
-        let mut st0 = br.read_bits(32) as i64;
-        let mut st1 = br.read_bits(32) as i64;
-        let mut st2 = br.read_bits(32) as i64;
-        let mut st3 = br.read_bits(32) as i64;
+        let mut st0 = br.read_bits(32) as u32;
+        let mut st1 = br.read_bits(32) as u32;
+        let mut st2 = br.read_bits(32) as u32;
+        let mut st3 = br.read_bits(32) as u32;
 
         if block.is_empty() {
             return true;
@@ -956,37 +962,41 @@ impl AnsDecoder {
             self.buffer[sz..guard_end].fill(0);
         }
 
+        let buffer = &self.buffer[..];
+        let symbols = &self.symbols[..];
+        let f2s = &self.f2s[..];
         let mut n = 0usize;
         let lr = self.log_range;
-        let mask = (1i64 << lr) - 1;
+        let mask = (1u32 << lr) - 1;
         let end4 = block.len() & !3;
 
         if self.order == 0 {
-            for i in (0..end4).step_by(4) {
-                let cur3 = self.f2s[(st3 & mask) as usize];
+            let mut i = 0;
+
+            while i < end4 {
+                // A group of four symbols reads at most buffer[n + 7] and
+                // advances n by at most 8, so one bounds check covers it.
+                // Reading unconditionally looks up to six bytes further ahead
+                // than the old branching form did, so this is what keeps the
+                // read inside the buffer; a valid chunk never runs out, since
+                // the cursor advances with the consumed bits (at most eight per
+                // symbol) while the buffer holds the payload plus padding.
+                let Some(w) = window8(buffer, n) else { return false };
+                let mut k = 0usize;
+                let cur3 = f2s[(st3 & mask) as usize];
                 block[i] = cur3;
-                let s = self.symbols[cur3 as usize];
-                let (nn, ns) = self.decode_symbol(n, st3, s, mask);
-                n = nn;
-                st3 = ns;
-                let cur2 = self.f2s[(st2 & mask) as usize];
+                (st3, k) = decode_symbol(st3, symbols[cur3 as usize], lr, mask, w, k);
+                let cur2 = f2s[(st2 & mask) as usize];
                 block[i + 1] = cur2;
-                let s = self.symbols[cur2 as usize];
-                let (nn, ns) = self.decode_symbol(n, st2, s, mask);
-                n = nn;
-                st2 = ns;
-                let cur1 = self.f2s[(st1 & mask) as usize];
+                (st2, k) = decode_symbol(st2, symbols[cur2 as usize], lr, mask, w, k);
+                let cur1 = f2s[(st1 & mask) as usize];
                 block[i + 2] = cur1;
-                let s = self.symbols[cur1 as usize];
-                let (nn, ns) = self.decode_symbol(n, st1, s, mask);
-                n = nn;
-                st1 = ns;
-                let cur0 = self.f2s[(st0 & mask) as usize];
+                (st1, k) = decode_symbol(st1, symbols[cur1 as usize], lr, mask, w, k);
+                let cur0 = f2s[(st0 & mask) as usize];
                 block[i + 3] = cur0;
-                let s = self.symbols[cur0 as usize];
-                let (nn, ns) = self.decode_symbol(n, st0, s, mask);
-                n = nn;
-                st0 = ns;
+                (st0, k) = decode_symbol(st0, symbols[cur0 as usize], lr, mask, w, k);
+                n += k;
+                i += 4;
             }
         } else {
             // order 1
@@ -995,30 +1005,21 @@ impl AnsDecoder {
             let (mut prv0, mut prv1, mut prv2, mut prv3) = (0usize, 0usize, 0usize, 0usize);
 
             while i0 < quarter {
-                let cur3 = self.f2s[(prv3 << lr) + (st3 & mask) as usize];
+                let Some(w) = window8(buffer, n) else { return false };
+                let mut k = 0usize;
+                let cur3 = f2s[(prv3 << lr) + (st3 & mask) as usize];
                 block[i3] = cur3;
-                let s = self.symbols[(prv3 << 8) | cur3 as usize];
-                let (nn, ns) = self.decode_symbol(n, st3, s, mask);
-                n = nn;
-                st3 = ns;
-                let cur2 = self.f2s[(prv2 << lr) + (st2 & mask) as usize];
+                (st3, k) = decode_symbol(st3, symbols[(prv3 << 8) | cur3 as usize], lr, mask, w, k);
+                let cur2 = f2s[(prv2 << lr) + (st2 & mask) as usize];
                 block[i2] = cur2;
-                let s = self.symbols[(prv2 << 8) | cur2 as usize];
-                let (nn, ns) = self.decode_symbol(n, st2, s, mask);
-                n = nn;
-                st2 = ns;
-                let cur1 = self.f2s[(prv1 << lr) + (st1 & mask) as usize];
+                (st2, k) = decode_symbol(st2, symbols[(prv2 << 8) | cur2 as usize], lr, mask, w, k);
+                let cur1 = f2s[(prv1 << lr) + (st1 & mask) as usize];
                 block[i1] = cur1;
-                let s = self.symbols[(prv1 << 8) | cur1 as usize];
-                let (nn, ns) = self.decode_symbol(n, st1, s, mask);
-                n = nn;
-                st1 = ns;
-                let cur0 = self.f2s[(prv0 << lr) + (st0 & mask) as usize];
+                (st1, k) = decode_symbol(st1, symbols[(prv1 << 8) | cur1 as usize], lr, mask, w, k);
+                let cur0 = f2s[(prv0 << lr) + (st0 & mask) as usize];
                 block[i0] = cur0;
-                let s = self.symbols[(prv0 << 8) | cur0 as usize];
-                let (nn, ns) = self.decode_symbol(n, st0, s, mask);
-                n = nn;
-                st0 = ns;
+                (st0, k) = decode_symbol(st0, symbols[(prv0 << 8) | cur0 as usize], lr, mask, w, k);
+                n += k;
                 prv3 = cur3 as usize;
                 prv2 = cur2 as usize;
                 prv1 = cur1 as usize;
@@ -1031,10 +1032,116 @@ impl AnsDecoder {
         }
 
         for i in end4..block.len() {
-            block[i] = self.buffer[n];
+            let Some(&b) = buffer.get(n) else { return false };
+            block[i] = b;
             n += 1;
         }
 
         n == sz
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bitio::{BitReader, BitWriter};
+
+    /// Bytes with a skewed, context-dependent distribution, so both the order-0
+    /// and the order-1 coder have something to model.
+    fn skewed(n: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(n);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut prev = 0u8;
+
+        while v.len() < n {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let r = (seed >> 33) as u32;
+            let b = match r % 8 {
+                0..=3 => prev.wrapping_add(1),
+                4 | 5 => b'a' + (r % 26) as u8,
+                6 => (r >> 8) as u8,
+                _ => 0,
+            };
+            v.push(b);
+            prev = b;
+        }
+
+        v
+    }
+
+    fn encoded(data: &[u8], order: u32, chunk: Option<usize>) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        let mut enc = AnsEncoder::new(order, chunk, None).unwrap();
+        assert_eq!(enc.write(data, &mut bw), data.len());
+        bw.finish()
+    }
+
+    fn roundtrip(data: &[u8], order: u32, chunk: Option<usize>) {
+        let payload = encoded(data, order, chunk);
+        let mut br = BitReader::new(&payload);
+        let mut out = vec![0u8; data.len()];
+        let mut dec = AnsDecoder::new(order, chunk).unwrap();
+
+        assert_eq!(dec.read(&mut br, &mut out).unwrap(), data.len());
+        assert_eq!(out, data, "order {order}, {} bytes", data.len());
+    }
+
+    #[test]
+    fn roundtrip_orders_sizes_and_chunk_sizes() {
+        for &order in &[0u32, 1] {
+            // Sizes around the raw-copy cutoff (32) and around the group of
+            // four the decoder reads at a time, so the odd tail is covered.
+            for &n in &[0usize, 1, 17, 32, 33, 35, 100, 4095, 70_001] {
+                roundtrip(&skewed(n), order, None);
+            }
+
+            // Several chunks, and a chunk boundary that is not a multiple of 4.
+            roundtrip(&skewed(40_000), order, Some(1024));
+            roundtrip(&skewed(40_000), order, Some(3999));
+
+            // Single-symbol chunks take a separate path in the decoder.
+            roundtrip(&vec![0xA7u8; 50_000], order, None);
+        }
+    }
+
+    fn decodes_without_panicking(bad: &[u8], order: u32, len: usize) -> Option<Vec<u8>> {
+        let mut br = BitReader::new(bad);
+        let mut out = vec![0u8; len];
+        let mut dec = AnsDecoder::new(order, None).unwrap();
+
+        dec.read(&mut br, &mut out).ok().map(|_| out)
+    }
+
+    #[test]
+    fn corrupt_payload_is_rejected_without_panicking() {
+        // A length that is not a multiple of four, so the odd tail runs too.
+        let data = skewed(20_003);
+
+        for &order in &[0u32, 1] {
+            let payload = encoded(&data, order, None);
+            let mut wrong = 0;
+
+            // Walk the payload rather than a few spots: the decoder must stay
+            // inside its buffer whatever the bits say.
+            for pos in (0..payload.len()).step_by(37) {
+                let mut bad = payload.clone();
+                bad[pos] ^= 0x5A;
+
+                if decodes_without_panicking(&bad, order, data.len()).as_deref() != Some(&data[..]) {
+                    wrong += 1;
+                }
+            }
+
+            assert!(wrong > 0, "order {order}: corruption went unnoticed everywhere");
+
+            // Zeroing the tail of the payload drives the decoder into
+            // renormalizing on every symbol, which is what walks the read
+            // cursor off the end of its buffer fastest.
+            for pos in (payload.len() / 2..payload.len()).step_by(101) {
+                let mut bad = payload.clone();
+                bad[pos..].fill(0);
+                decodes_without_panicking(&bad, order, data.len());
+            }
+        }
     }
 }
