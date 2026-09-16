@@ -39,7 +39,7 @@ const EXE_ARM_OPCODE_BL: u32 = 0x9400_0000;
 // live use here, same as Go's unreachable else branch).
 const EXE_ARM_CB_OPCODE_MASK: u32 = 0x7F00_0000;
 const EXE_ARM_OPCODE_CBZ: u32 = 0x3400_0000;
-const EXE_ARM_OPCODE_CBNZ: u32 = 0x0350_0000;
+const EXE_ARM_OPCODE_CBNZ: u32 = 0x3500_0000;
 const EXE_WIN_PE: u32 = 0x0000_4550;
 const EXE_WIN_X86_ARCH: u16 = 0x014C;
 const EXE_WIN_AMD64_ARCH: u16 = 0x8664;
@@ -1096,4 +1096,75 @@ fn parse_exe_header(
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ARM64 code whose only branches are CBNZ, laid out so the detector's
+    /// other gates (data type BIN, enough zero and 0xFF bytes, not too many
+    /// small values) pass: what decides the outcome is the CBNZ opcode
+    /// alone. A wrong CBNZ constant (this port had 0x03500000 for
+    /// 0x35000000) makes the detector miss every branch and decline the
+    /// transform -- which cost 0.74% of compressed size at level 4 on
+    /// silesia.tar's `mozilla`, where kanzi-cpp applies it.
+    fn arm64_block_with_cbnz(n: usize) -> Vec<u8> {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut out = Vec::with_capacity(n + 4);
+
+        while out.len() < n {
+            let r = next();
+
+            if r % 8 == 0 {
+                // One instruction in eight is CBNZ: 0x35 is its opcode byte,
+                // which little-endian puts last.
+                out.extend_from_slice(&[r as u8, (r >> 8) as u8, (r >> 16) as u8, 0x35]);
+                continue;
+            }
+
+            // Filler: three data bytes -- ~13% zero and ~3% 0xFF, since the
+            // detector wants both, the rest spread over the middle of the
+            // range so "small values" stay well under half -- then a fixed
+            // high byte that matches no branch opcode, so only the CBNZ
+            // instructions above can be counted.
+            for k in 0..3 {
+                let b = (r >> (8 * k)) as u8;
+                out.push(match b % 50 {
+                    0..=9 => 0,
+                    10 | 11 => 0xFF,
+                    _ => 0x10 | (b & 0x7F),
+                });
+            }
+
+            out.push(0x5A);
+        }
+
+        out.truncate(n);
+        out
+    }
+
+    #[test]
+    fn detects_arm64_code_branching_with_cbnz() {
+        let data = arm64_block_with_cbnz(1 << 20);
+        let (mode, code_start, code_end) = detect_exe_type(&data);
+        assert_eq!(mode & EXE_NOT_EXE, 0, "detector declined ARM64 code: mode={mode:#x}");
+        assert_eq!(mode, EXE_ARM64, "expected ARM64");
+        assert_eq!((code_start, code_end), (0, data.len()));
+
+        // The ARM64 *transform* only rewrites B/BL (CBZ/CBNZ are disabled
+        // upstream too), so this block has nothing for it to rewrite and
+        // `forward` declines -- detection is what this pins down. Level
+        // 4/8/9 round trips cover the transform itself.
+        assert!(matches!(
+            forward(&data, &mut vec![0u8; max_encoded_len(data.len())], DataType::Undefined),
+            Err(("ExeCodec forward transform skip: Too few calls/jumps", _))
+        ));
+    }
 }
