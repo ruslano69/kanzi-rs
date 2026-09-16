@@ -543,7 +543,20 @@ pub fn inverse(
                 break;
             }
 
-            dst[dst_idx..dst_idx + length].copy_from_slice(&pe.ptr[0..length]);
+            // Words are at most TC_MAX_WORD_LENGTH (31) bytes, so two whole
+            // 16-byte copies cover any of them (same trick as text_codec.rs's
+            // inverse, worth ~30% there). They may read and write up to 31
+            // bytes past the word; both sides are checked to have the room,
+            // and the extra output bytes are overwritten by what comes next.
+            if pe.ptr.len() >= 32 && dst_idx + 32 <= dst.len() {
+                dst[dst_idx..dst_idx + 16].copy_from_slice(&pe.ptr[..16]);
+
+                if length > 16 {
+                    dst[dst_idx + 16..dst_idx + 32].copy_from_slice(&pe.ptr[16..32]);
+                }
+            } else {
+                dst[dst_idx..dst_idx + length].copy_from_slice(&pe.ptr[..length]);
+            }
 
             if cur == TC_ESCAPE_TOKEN2 {
                 dst[dst_idx] ^= 0x20;
