@@ -808,8 +808,22 @@ impl RolzCodec {
 
                     let mut src_inc = 0i64;
                     let abs_dst = start_chunk + dst_idx;
-                    dst[abs_dst..abs_dst + lit_len]
-                        .copy_from_slice(&self.lit_buf[lit_idx..lit_idx + lit_len]);
+
+                    // Whole 16-byte copies when both sides have the room:
+                    // literal runs are short, and an exact-length copy costs a
+                    // memcpy call each (same shape as lzx.rs's literals).
+                    if lit_idx + lit_len + 16 <= self.lit_buf.len() && abs_dst + lit_len + 16 <= dst.len() {
+                        let mut i = 0;
+
+                        while i < lit_len {
+                            dst[abs_dst + i..abs_dst + i + 16]
+                                .copy_from_slice(&self.lit_buf[lit_idx + i..lit_idx + i + 16]);
+                            i += 16;
+                        }
+                    } else {
+                        dst[abs_dst..abs_dst + lit_len]
+                            .copy_from_slice(&self.lit_buf[lit_idx..lit_idx + lit_len]);
+                    }
 
                     if self.min_match == MIN_MATCH3 {
                         let mut n = 0usize;
@@ -880,7 +894,20 @@ impl RolzCodec {
                 // first and yields different bytes on forward overlap.
                 let mlen = match_len + self.min_match as usize;
 
-                if abs_dst >= r + mlen {
+                if abs_dst - r >= 8 && mlen <= 32 && abs_dst + mlen + 8 <= dst.len() {
+                    // kanzi-cpp's emitCopy: whole 8-byte copies while the
+                    // distance keeps them non-overlapping, overshooting up to
+                    // 7 bytes past the match (overwritten by what follows).
+                    let (mut d, mut m) = (abs_dst, r);
+                    let mut left = mlen as i64;
+
+                    while left > 0 {
+                        dst.copy_within(m..m + 8, d);
+                        d += 8;
+                        m += 8;
+                        left -= 8;
+                    }
+                } else if abs_dst >= r + mlen {
                     dst.copy_within(r..r + mlen, abs_dst);
                 } else {
                     // Handle overlapping segments
