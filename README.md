@@ -111,7 +111,8 @@ built wheel) plus a random-bytes incompressible baseline — deliberately not
 synthetic/repetitive data, since that's what caught a real encoder bug during
 development (see git log).
 
-See [BENCHMARKS.md](BENCHMARKS.md) for numbers against the Silesia corpus.
+See [BENCHMARKS.md](BENCHMARKS.md) for numbers against the Silesia corpus, and
+[CHANGELOG.md](CHANGELOG.md) for what changed between releases.
 
 ## Status
 
