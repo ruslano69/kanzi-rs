@@ -41,3 +41,8 @@ manifest-path = "crates/kanzi-py/Cargo.toml"
 # crates/kanzi-py/Cargo.toml's [lib] name already sets the compiled module
 # name to `kanzi`; spelled out here too since it's what `import kanzi` loads.
 module-name = "kanzi"
+# The sdist is built from crates/kanzi-py, but LICENSE lives at the repo
+# root while the wheel METADATA declares it as License-File. Without this
+# PyPI rejects the sdist with "400 License-File ... does not exist".
+# (Single LICENSE file, like kanzi-go.)
+include = [{ path = "LICENSE", format = "sdist" }]

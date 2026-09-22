@@ -1,6 +1,6 @@
 [package]
 name = "kanzi"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "Rust port of the kanzi lossless compressor (bitstream v7, byte-compatible with kanzi-go/kanzi-cpp)"

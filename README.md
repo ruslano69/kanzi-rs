@@ -126,4 +126,4 @@ triggers it.
 kanzi-rs is a derivative work of [kanzi-go](https://github.com/flanglet/kanzi-go)
 (Copyright 2011-2026 Frederic Langlet), which is licensed under the
 [Apache License, Version 2.0](LICENSE). This project is licensed under the same
-terms; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+terms; see [LICENSE](LICENSE).

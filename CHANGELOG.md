@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2 — 2026-09-22
+
+- PyPI packaging fix: LICENSE is now included in the sdist (it lives at
+  the repo root while maturin builds the sdist from `crates/kanzi-py`;
+  without it PyPI rejects the upload with "400 License-File ... does not
+  exist"). License layout kept as in kanzi-go: single LICENSE file.
+
 ## 0.2.1 — 2026-09-22
 
 - Huffman encoder: the `limit_code_lengths` slow path now renormalizes
