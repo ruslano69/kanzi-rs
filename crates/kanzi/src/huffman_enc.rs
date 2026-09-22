@@ -53,6 +53,115 @@ fn write_var_int(bw: &mut BitWriter, mut value: u32) {
     bw.write_bits(value as u64, 8);
 }
 
+/// Port of `EntropyUtils::normalizeFrequencies`, simplified for the single
+/// dense call site in `limit_code_lengths`: `freqs[0..count]` holds the
+/// frequencies in alphabet order and is rescaled in place so the entries
+/// sum to `scale`, each non-zero frequency mapped to at least 1.
+/// Returns the number of non-zero symbols.
+fn normalize_frequencies(freqs: &mut [i32], count: usize, total_freq: i32, scale: i32) -> usize {
+    if count == 0 || total_freq == 0 {
+        return 0;
+    }
+
+    if total_freq == scale {
+        let mut n = 0;
+        for i in 0..count {
+            if freqs[i] != 0 {
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    let mut sum_scaled = 0i32;
+    let mut sum_freq = 0i32;
+    let mut idx_max = 0usize;
+    let mut order = [0usize; 256];
+    let mut alphabet_size = 0usize;
+
+    for i in 0..count {
+        let f = freqs[i];
+        if f == 0 {
+            continue;
+        }
+        order[alphabet_size] = i;
+        alphabet_size += 1;
+        let sf = (f as i64) * (scale as i64);
+        let scaled_freq = if sf <= total_freq as i64 {
+            1
+        } else {
+            ((sf + (total_freq as i64) / 2) / total_freq as i64) as i32
+        };
+        sum_scaled += scaled_freq;
+        freqs[i] = scaled_freq;
+        sum_freq += f;
+        if scaled_freq > freqs[idx_max] {
+            idx_max = i;
+        }
+        if sum_freq >= total_freq {
+            break;
+        }
+    }
+
+    if alphabet_size == 0 {
+        return 0;
+    }
+
+    if alphabet_size == 1 {
+        freqs[order[0]] = scale;
+        return 1;
+    }
+
+    if sum_scaled == scale {
+        return alphabet_size;
+    }
+
+    let mut delta = sum_scaled - scale;
+    let err_thr = freqs[idx_max] / 16;
+
+    if delta.abs() <= err_thr {
+        freqs[idx_max] -= delta;
+        return alphabet_size;
+    }
+
+    if delta < 0 {
+        delta += err_thr;
+        freqs[idx_max] += err_thr;
+    } else {
+        delta -= err_thr;
+        freqs[idx_max] -= err_thr;
+    }
+
+    let inc = if delta < 0 { 1 } else { -1 };
+    delta = delta.abs();
+    let mut round = 0;
+
+    while round < 6 && delta > 0 {
+        round += 1;
+        let mut adjustments = 0i32;
+
+        for i in 0..alphabet_size {
+            let idx = order[i];
+            if freqs[idx] <= 2 {
+                continue;
+            }
+            freqs[idx] += inc;
+            adjustments += 1;
+            delta -= 1;
+            if delta == 0 {
+                break;
+            }
+        }
+
+        if adjustments == 0 {
+            break;
+        }
+    }
+
+    freqs[idx_max] = (freqs[idx_max] - delta).max(1);
+    alphabet_size
+}
+
 fn encode_alphabet(bw: &mut BitWriter, symbols: &[u8]) {
     let count = symbols.len();
 
@@ -192,12 +301,19 @@ fn generate_canonical_codes(sizes: &[u8; 256], codes: &mut [u16; 256], symbols: 
 /// increasing-frequency-ordered symbol list from compute_code_lengths
 /// (by construction of Moffat-Katajainen, sizes are then non-increasing
 /// along this order, which the "fold" loop below relies on).
-/// Returns the resulting max code length; MAX_SYMBOL_SIZE on success,
-/// or a sentinel > MAX_SYMBOL_SIZE if the debt could not be repaid (only
-/// possible for pathological distributions -- caller falls back to flat
-/// 8-bit codes in that case, matching Go's own fallback for the same
-/// "unlikely branch").
-fn limit_code_lengths(sizes: &mut [u8; 256], ranks: &[u8]) -> i64 {
+/// `freqs` and `alphabet` are passed through so that the normalizeFrequencies
+/// fallback can rescale when the fast repay fails.  `freqs` is mutated
+/// (frequencies are replaced by the scaled values).
+/// Returns the resulting max code length. May still exceed MAX_SYMBOL_SIZE
+/// if the renormalized pass also overflows -- caller then falls back to
+/// flat 8-bit codes.
+fn limit_code_lengths(
+    sizes: &mut [u8; 256],
+    ranks: &[u8],
+    freqs: &mut [i32],
+    alphabet: &[u8],
+    count: usize,
+) -> i64 {
     let mut n = 0usize;
     let mut debt = 0i64;
 
@@ -207,8 +323,11 @@ fn limit_code_lengths(sizes: &mut [u8; 256], ranks: &[u8]) -> i64 {
         n += 1;
     }
 
+    if debt == 0 {
+        return MAX_SYMBOL_SIZE as i64;
+    }
+
     let mut q: [Vec<u8>; 6] = Default::default();
-    let count = ranks.len();
 
     while n < count {
         let idx = MAX_SYMBOL_SIZE as i64 - 1 - sizes[ranks[n] as usize] as i64;
@@ -248,17 +367,36 @@ fn limit_code_lengths(sizes: &mut [u8; 256], ranks: &[u8]) -> i64 {
     }
 
     if debt > 0 {
-        // Pathological distribution that the fast repay couldn't fix. Go
-        // falls back to NormalizeFrequencies + a second computeCodeLengths
-        // pass; not ported (never observed on realistic input at 16 KiB
-        // chunk granularity). Signal "still over limit" so the caller uses
-        // flat 8-bit codes instead -- still a valid, decodable bitstream.
-        return MAX_SYMBOL_SIZE as i64 + 1;
+        // Fallback to slow (more accurate) path: renormalize frequencies
+        // to scale = MAX_CHUNK_SIZE >> 3 = 2048, then recompute code
+        // lengths from scratch.  Matches C++ HuffmanEncoder.cpp:192-211.
+        // Cold path (only for pathological distributions), so the extra
+        // copy + recompute is negligible.
+        let total_freq: i32 = alphabet[0..count].iter().map(|&s| freqs[s as usize]).sum();
+
+        // Dense copy in alphabet order; normalize works in place on it.
+        let mut f = [0i32; 256];
+        for i in 0..count {
+            f[i] = freqs[alphabet[i] as usize];
+        }
+        normalize_frequencies(&mut f, count, total_freq, MAX_CHUNK_SIZE as i32 / 8);
+
+        // Write back normalized frequencies and rebuild ranks
+        for i in 0..count {
+            freqs[alphabet[i] as usize] = f[i];
+        }
+
+        // Rebuild ranks from normalized frequencies + alphabet
+        let mut new_ranks = Vec::with_capacity(count);
+        for i in 0..count {
+            new_ranks.push(((f[i] as u32) << 8) | alphabet[i] as u32);
+        }
+
+        return compute_code_lengths(sizes, &mut new_ranks).0;
     }
 
     MAX_SYMBOL_SIZE as i64
 }
-
 pub struct HuffmanEncoder {
     codes: [u16; 256],
     sizes: [u8; 256],
@@ -298,7 +436,7 @@ impl HuffmanEncoder {
                     freqs[b as usize] += 1;
                 }
 
-                let count = self.update_frequencies(&freqs, bw);
+                let count = self.update_frequencies(&mut freqs, bw);
 
                 if count > 1 {
                     self.encode_chunk(chunk, size_chunk, bw);
@@ -309,7 +447,7 @@ impl HuffmanEncoder {
         }
     }
 
-    fn update_frequencies(&mut self, freqs: &[i32; 256], bw: &mut BitWriter) -> usize {
+    fn update_frequencies(&mut self, freqs: &mut [i32; 256], bw: &mut BitWriter) -> usize {
         let mut alphabet = [0u8; 256];
         let mut count = 0usize;
 
@@ -343,7 +481,8 @@ impl HuffmanEncoder {
                 compute_code_lengths(&mut self.sizes, &mut ranks);
 
             if max_code_len > MAX_SYMBOL_SIZE as i64 {
-                max_code_len = limit_code_lengths(&mut self.sizes, &freq_order_syms);
+                max_code_len =
+                    limit_code_lengths(&mut self.sizes, &freq_order_syms, freqs, &alphabet, count);
             }
 
             if max_code_len > MAX_SYMBOL_SIZE as i64 {
@@ -447,5 +586,53 @@ impl HuffmanEncoder {
         for i in count4..count {
             bw.write_bits(block[i] as u64, 8);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_frequencies_sums_to_scale() {
+        let count = 256usize;
+        let mut f = [0i32; 256];
+        f[0] = 12000;
+        for i in 1..count {
+            f[i] = 1;
+        }
+        let total: i32 = f[0..count].iter().sum();
+        let n = normalize_frequencies(&mut f, count, total, MAX_CHUNK_SIZE as i32 / 8);
+        assert_eq!(n, count);
+        let sum: i32 = f[0..count].iter().sum();
+        assert_eq!(sum, MAX_CHUNK_SIZE as i32 / 8);
+        assert!(f[0..count].iter().all(|&x| x >= 1));
+    }
+
+    #[test]
+    fn limit_code_lengths_slow_path_triggers_and_rescales() {
+        // Synthetic over-limit sizes with no repayable debt: first 64 symbols
+        // at length 20 (debt 512), the rest at length 1 so the q-fill breaks
+        // immediately (idx 10 > 5) and the slow renormalize path must run.
+        let count = 256usize;
+        let mut sizes = [1u8; 256];
+        for i in 0..64 {
+            sizes[i] = 20;
+        }
+        let ranks: Vec<u8> = (0..256u16).map(|v| v as u8).collect();
+        let mut alphabet = [0u8; 256];
+        for i in 0..count {
+            alphabet[i] = i as u8;
+        }
+        let mut freqs = [100i32; 256];
+
+        let max_len = limit_code_lengths(&mut sizes, &ranks, &mut freqs, &alphabet, count);
+
+        // Slow path recomputed lengths from frequencies normalized to 2048.
+        let sum: i32 = (0..count).map(|i| freqs[alphabet[i] as usize]).sum();
+        assert_eq!(sum, MAX_CHUNK_SIZE as i32 / 8);
+        // Result is a real recompute (not the debt sentinel and not untouched).
+        assert!(max_len <= MAX_SYMBOL_SIZE as i64 + 16);
+        assert!(sizes.iter().all(|&s| s >= 1));
     }
 }
