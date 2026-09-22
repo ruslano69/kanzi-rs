@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1 — 2026-09-22
+
+- Huffman encoder: the `limit_code_lengths` slow path now renormalizes
+  frequencies (scale 2048) and recomputes code lengths instead of falling
+  back to flat 8-bit codes, matching kanzi-cpp; plus unit tests covering
+  the fallback.
+- Python distribution renamed to `kanzi` and published to PyPI
+  (`pip install kanzi`); release wheels + sdist are built by
+  `.github/workflows/publish.yml` via Trusted Publishing.
+
 ## 0.2.0 — 2026-09-16
 
 Decode at levels 1–4, where kanzi-cpp used to be 1.7–3.4x faster, is now

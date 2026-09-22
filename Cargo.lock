@@ -53,21 +53,21 @@ dependencies = [
 
 [[package]]
 name = "kanzi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libsais",
 ]
 
 [[package]]
 name = "kanzi-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "kanzi",
 ]
 
 [[package]]
 name = "kanzi-py"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "kanzi",
  "pyo3",
