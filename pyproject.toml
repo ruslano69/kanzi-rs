@@ -3,14 +3,26 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "kanzi-rs"
-description = "Rust port of kanzi-go (lossless data compressor), exposed as a Python extension module"
+name = "kanzi"
+description = "Rust port of the kanzi lossless data compressor, exposed as a Python extension module"
 readme = "README.md"
+authors = [
+    { name = "ruslano69", email = "ruslano69@gmail.com" },
+]
 license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
 dynamic = ["version"]
+keywords = ["compression", "lossless", "kanzi", "archiving"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
     "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: Implementation :: CPython",
     "License :: OSI Approved :: Apache Software License",
     "Topic :: System :: Archiving :: Compression",
