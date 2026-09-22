@@ -107,6 +107,9 @@ jobs:
     runs-on: ubuntu-latest
     if: "startsWith(github.ref, 'refs/tags/')"
     needs: [linux, windows, macos, sdist]
+    permissions:
+      # Required for PyPI Trusted Publishing (OIDC), no API token needed.
+      id-token: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -114,9 +117,4 @@ jobs:
           merge-multiple: true
           path: dist
       - name: Publish to PyPI
-        uses: PyO3/maturin-action@v1
-        env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-        with:
-          command: upload
-          args: --non-interactive --skip-existing dist/*
+        uses: pypa/gh-action-pypi-publish@release/v1
